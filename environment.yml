@@ -1,0 +1,22 @@
+name: low_frq_dbs_eed
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - mne
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - jupyterlab
+  - ipykernel
+  - pip:
+    - hampel
+    # Note: mne_denoise might be a local module or a specific GitHub repo. 
+    # If it's a standard pip package, this will grab it. If it's a local file, 
+    # just keep it in your working directory.
+    - mne-denoise
