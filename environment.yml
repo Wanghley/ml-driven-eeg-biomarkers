@@ -1,11 +1,12 @@
-name: low_frq_dbs_eed
+name: eeg_thesis_v1
 channels:
+  - pytorch
   - conda-forge
   - defaults
 dependencies:
   - python=3.10
   - pip
-  - mne
+  - mne=1.10.2
   - numpy
   - pandas
   - scipy
@@ -14,9 +15,13 @@ dependencies:
   - seaborn
   - jupyterlab
   - ipykernel
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cpuonly # Change to 'pytorch-cuda=11.8' etc if you have a GPU
   - pip:
     - hampel
-    # Note: mne_denoise might be a local module or a specific GitHub repo. 
-    # If it's a standard pip package, this will grab it. If it's a local file, 
-    # just keep it in your working directory.
     - mne-denoise
+    - mne-icalabel  # For automated ICA labeling
+    - yasa           # For sleep EEG analysis
+    - pyod           # For outlier/spike detection
