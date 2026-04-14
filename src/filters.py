@@ -236,24 +236,35 @@ class ArtifactFilterFactory:
         
         # Alias mapping for convenience
         method_aliases = {
-            'time_domain_hampel': 'hampel_time',
-            'freq_domain_hampel': 'hampel_freq',
+            'time_domain_hampel':     'hampel_time',
+            'freq_domain_hampel':     'hampel_freq',
             'spectral_interpolation': 'spectrum_fit',
-            'chen': 'zapline',
+            'chen':                   'zapline',
+            # New surgical methods
+            'fft_interp':             'fft_spectral_interp',
+            'spectral_interp':        'fft_spectral_interp',
+            'narrow_interp':          'fft_spectral_interp',
+            'sin_regression':         'sinusoidal_regression',
+            'harmonic_regression':    'sinusoidal_regression',
+            'harmonic_subtraction':   'sinusoidal_regression',
         }
         method = method_aliases.get(method, method)
-        
+
         # Ensure data is 2D
         original_shape = data.shape
         if data.ndim == 1:
             data = data.reshape(1, -1)
         elif data.ndim > 2:
             raise ValueError(f"Expected 1D or 2D array, got shape {data.shape}")
-        
+
         if method == 'hampel_time':
             clean_data = cls._apply_time_domain_hampel(data, sfreq, **kwargs)
         elif method == 'hampel_freq':
             clean_data = cls._apply_freq_domain_hampel(data, sfreq, **kwargs)
+        elif method == 'fft_spectral_interp':
+            clean_data = cls._apply_fft_spectral_interp(data, sfreq, **kwargs)
+        elif method == 'sinusoidal_regression':
+            clean_data = cls._apply_sinusoidal_regression(data, sfreq, **kwargs)
         elif method == 'spectrum_fit':
             clean_data = cls._apply_spectral_interpolation(data, sfreq, **kwargs)
         elif method == 'zapline':
@@ -265,6 +276,26 @@ class ArtifactFilterFactory:
                            f"Try: 'hampel_time', 'hampel_freq', 'spectrum_fit', 'zapline', 'comb_notch'")
             
         return clean_data.reshape(original_shape)
+
+    @staticmethod
+    def _fold_to_nyquist(freq_hz: float, sfreq: float) -> float:
+        """Fold a target frequency into (0, Nyquist) to handle aliasing safely."""
+        nyquist = sfreq / 2.0
+        if freq_hz <= 0:
+            raise ValueError(f"Target frequency must be > 0 Hz, got {freq_hz}")
+
+        if freq_hz < nyquist:
+            return freq_hz
+
+        # Frequency folding for sampled signals: map to aliased in-band component.
+        folded = abs(((freq_hz + nyquist) % (2 * nyquist)) - nyquist)
+        if np.isclose(folded, 0.0):
+            folded = nyquist * 0.95
+        folded = min(folded, nyquist * 0.999)
+
+        print(f"  Target frequency {freq_hz:.2f} Hz exceeds Nyquist ({nyquist:.2f} Hz); "
+              f"using aliased in-band target {folded:.2f} Hz")
+        return folded
 
     @staticmethod
     def _apply_time_domain_hampel(data: np.ndarray, sfreq: float, 
@@ -397,19 +428,202 @@ class ArtifactFilterFactory:
         Rigorous IIR comb filter specifically designed to notch a fundamental frequency 
         and all its harmonics up to the Nyquist limit, while preserving intermediate bands.
         """
+        f0 = ArtifactFilterFactory._fold_to_nyquist(float(f0), sfreq)
         print(f"Applying Comb Filter (f0={f0}Hz, Q={q_factor})")
-        
-        # Design IIR comb filter
-        # w0 is the normalized frequency (w0 = f0 / (fs/2))
+
         nyq = sfreq / 2.0
-        w0 = f0 / nyq
-        
-        # Create numerator and denominator polynomials
-        b, a = signal.iircomb(w0, q_factor, ftype='notch')
-        
-        # Zero-phase forward and reverse filtering
-        cleaned_data = signal.filtfilt(b, a, data, axis=1)
+        harmonics = np.arange(f0, nyq, f0)
+        cleaned_data = np.copy(data)
+
+        # Robust comb behavior: cascade individual notch filters at each harmonic.
+        for h in harmonics:
+            if h <= 0 or h >= nyq:
+                continue
+            b, a = signal.iirnotch(w0=h, Q=q_factor, fs=sfreq)
+            cleaned_data = signal.filtfilt(b, a, cleaned_data, axis=1)
+
         return cleaned_data
+
+    @staticmethod
+    def _apply_fft_spectral_interp(
+        data: np.ndarray,
+        sfreq: float,
+        f_target: float = 7.0,
+        half_width_bins: int = 2,
+        interp_flank_bins: int = 10,
+    ) -> np.ndarray:
+        """
+        FFT Spectral Interpolation — surgical DBS harmonic removal.
+
+        For each DBS harmonic k·f_target the algorithm:
+          1. Locates the nearest FFT bin.
+          2. Identifies the "artifact zone": (2·half_width_bins + 1) bins centred
+             on the harmonic.
+          3. Fits a cubic-spline through ``interp_flank_bins`` reference bins on
+             each side of the artifact zone (brain-only spectrum estimate).
+          4. Replaces the artifact-zone magnitudes with the spline prediction
+             while keeping the original complex phase.
+          5. iFFT back to the time domain.
+
+        Effective removal bandwidth per harmonic
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        With ``half_width_bins=2`` and a 120 s recording at 256 Hz
+        (Δf = 0.0083 Hz/bin):
+
+            width = (2·2 + 1) × 0.0083 Hz ≈ **0.042 Hz**
+
+        Compare with the comb-notch alternatives:
+            Q = 50  →  −1 dB bandwidth ≈ 0.39 Hz  (≈ 9× wider)
+            Q = 200 →  −1 dB bandwidth ≈ 0.10 Hz  (≈ 2.4× wider)
+
+        Brain signal between harmonics is **completely untouched**.
+
+        Args
+        ----
+        f_target         : DBS fundamental frequency in Hz.
+        half_width_bins  : Half-width of artifact zone in FFT bins.
+                           Each bin = sfreq / n_samples Hz.
+                           Default 2 → 5 bins total ≈ 0.042 Hz at 120 s / 256 Hz.
+        interp_flank_bins: Number of reference bins on each side of the artifact
+                           zone used for cubic-spline interpolation.
+        """
+        from scipy.interpolate import CubicSpline
+
+        f_target = ArtifactFilterFactory._fold_to_nyquist(float(f_target), sfreq)
+        n_samples = data.shape[1]
+        freq_res  = sfreq / n_samples
+        nyquist   = sfreq / 2.0
+        harmonics = np.arange(f_target, nyquist, f_target)
+
+        print(f"FFT Spectral Interpolation: f₀={f_target} Hz, "
+              f"±{half_width_bins} bins ({(2*half_width_bins+1)*freq_res*1000:.1f} mHz per harmonic), "
+              f"{len(harmonics)} harmonics")
+
+        # Full-length FFT (one per channel, vectorised across channels)
+        S   = np.fft.rfft(data, axis=1)    # (n_ch, n_freq)
+        mag = np.abs(S)                     # amplitude spectrum
+        pha = np.angle(S)                   # phase spectrum
+        n_freq = S.shape[1]
+
+        for h in harmonics:
+            h_bin = int(round(h / freq_res))
+            if h_bin >= n_freq:
+                break
+
+            # Artifact zone (keep away from DC and Nyquist)
+            lo_bin = max(1, h_bin - half_width_bins)
+            hi_bin = min(n_freq - 2, h_bin + half_width_bins)
+
+            # Reference bins: flanking the artifact zone
+            ref_lo = np.arange(max(1, lo_bin - interp_flank_bins), lo_bin)
+            ref_hi = np.arange(hi_bin + 1, min(n_freq - 1, hi_bin + 1 + interp_flank_bins))
+            ref_bins = np.concatenate([ref_lo, ref_hi])
+
+            if len(ref_bins) < 4:   # need at least 4 pts for cubic spline
+                continue
+
+            art_bins = np.arange(lo_bin, hi_bin + 1)
+
+            # Fit cubic spline per channel through reference bins, evaluate at artifact bins
+            for ch in range(data.shape[0]):
+                cs = CubicSpline(ref_bins, mag[ch, ref_bins])
+                interp_vals = np.maximum(cs(art_bins), 0.0)   # magnitude ≥ 0
+                mag[ch, art_bins] = interp_vals
+
+        # Reconstruct complex spectrum preserving original phase
+        S_clean = mag * np.exp(1j * pha)
+        cleaned = np.fft.irfft(S_clean, n=n_samples, axis=1)
+
+        print(f"  → Effective removal: {(2*half_width_bins+1)*freq_res*1000:.1f} mHz per harmonic "
+              f"({len(harmonics)} harmonics, {(2*half_width_bins+1)*freq_res*len(harmonics)*1000:.1f} mHz total)")
+        return cleaned
+
+    @staticmethod
+    def _apply_sinusoidal_regression(
+        data: np.ndarray,
+        sfreq: float,
+        f_target: float = 7.0,
+        chunk_sec: float | None = None,
+    ) -> np.ndarray:
+        """
+        Sinusoidal Regression DBS Removal — the gold-standard approach for
+        stable-frequency DBS.
+
+        Models the DBS artifact as a linear combination of sinusoids at every
+        harmonic up to Nyquist:
+
+            x_dbs(t) = Σ_{k=1}^{K} [Aₖ sin(2π k f₀ t) + Bₖ cos(2π k f₀ t)]
+
+        Fits Aₖ, Bₖ per channel via Ordinary Least Squares (QR factorisation),
+        then subtracts the reconstructed model.
+
+        Why this preserves brain signals
+        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        The design matrix spans only exact-frequency sinusoids.  Any brain
+        signal whose frequency does not coincide exactly with a DBS harmonic
+        is mathematically orthogonal to the regressors and lands entirely in the
+        residual.  Even brain oscillations near (but not exactly at) a harmonic
+        are largely preserved because natural oscillations have a bandwidth of
+        several tenths of a Hz, while the regression only captures the
+        zero-bandwidth (perfectly periodic) component.
+
+        Limitation
+        ~~~~~~~~~~
+        Any brain activity that is exactly phase-locked to a DBS harmonic for
+        the full duration of the recording will be removed along with DBS.  In
+        practice, natural brain oscillations are not perfectly phase-locked for
+        more than a few seconds, so this is minor.
+
+        For non-stationary DBS (frequency drift > 0.01 Hz), use
+        ``chunk_sec`` to apply the regression in short overlapping windows.
+
+        Args
+        ----
+        f_target  : DBS fundamental frequency in Hz.
+        chunk_sec : If not None, apply regression in non-overlapping chunks of
+                    this duration (seconds).  Useful for recordings where DBS
+                    frequency drifts slowly.  Default None = full-recording fit.
+        """
+        f_target = ArtifactFilterFactory._fold_to_nyquist(float(f_target), sfreq)
+        nyquist   = sfreq / 2.0
+        harmonics = np.arange(f_target, nyquist, f_target)
+        n_ch, n_samples = data.shape
+
+        print(f"Sinusoidal Regression: f₀={f_target} Hz, {len(harmonics)} harmonics, "
+              f"chunk={'full' if chunk_sec is None else f'{chunk_sec}s'}")
+
+        def _regress_chunk(chunk: np.ndarray) -> np.ndarray:
+            """Fit and subtract the sinusoidal DBS model from a data chunk."""
+            n = chunk.shape[1]
+            t = np.arange(n) / sfreq
+
+            # Design matrix: [sin(2π f₁ t), cos(2π f₁ t), ..., sin(2π fK t), cos(2π fK t), 1]
+            cols = []
+            for h in harmonics:
+                cols.append(np.sin(2 * np.pi * h * t))
+                cols.append(np.cos(2 * np.pi * h * t))
+            cols.append(np.ones(n))                   # DC offset
+            X = np.stack(cols, axis=1)                # (n, 2K+1)
+
+            # OLS: X (n, p) · β (p, n_ch) ≈ chunk.T (n, n_ch)
+            # Use lstsq for numerical stability (QR internally)
+            beta, _, _, _ = np.linalg.lstsq(X, chunk.T, rcond=None)  # (p, n_ch)
+
+            # Reconstruct only the sinusoidal part (exclude DC column)
+            dbs_model = X[:, :-1] @ beta[:-1]     # (n, n_ch) — DBS estimate
+            return chunk - dbs_model.T
+
+        if chunk_sec is None:
+            cleaned = _regress_chunk(data)
+        else:
+            chunk_len = int(chunk_sec * sfreq)
+            cleaned   = np.zeros_like(data)
+            for start in range(0, n_samples, chunk_len):
+                end = min(start + chunk_len, n_samples)
+                cleaned[:, start:end] = _regress_chunk(data[:, start:end])
+            print(f"  Processed {int(np.ceil(n_samples/chunk_len))} chunks × {chunk_sec}s")
+
+        return cleaned
 
     @staticmethod
     def _apply_spectral_interpolation(data: np.ndarray, sfreq: float,
@@ -429,6 +643,7 @@ class ArtifactFilterFactory:
             chunk_sec: Window duration for STFT (seconds)
             attenuation_db: Target attenuation level in dB (more negative = stronger removal, default -60 dB)
         """
+        f_target = ArtifactFilterFactory._fold_to_nyquist(float(f_target), sfreq)
         print(f"Applying Spectrum-Fit Multi-Harmonic Removal (f={f_target}Hz, bandwidth={bandwidth}Hz, attenuation={attenuation_db}dB)")
         
         # Using Short-Time Fourier Transform to avoid massive array allocation overheads
@@ -436,7 +651,16 @@ class ArtifactFilterFactory:
         if nperseg > data.shape[1]:
             nperseg = data.shape[1]
             
-        f, t, Zxx = signal.stft(data, fs=sfreq, nperseg=nperseg, axis=1)
+        # Run STFT per channel for broad SciPy compatibility (avoids axis-specific istft APIs).
+        stft_channels = []
+        f = None
+        t = None
+        for ch in range(data.shape[0]):
+            f_ch, t_ch, z_ch = signal.stft(data[ch], fs=sfreq, nperseg=nperseg)
+            if f is None:
+                f, t = f_ch, t_ch
+            stft_channels.append(z_ch)
+        Zxx = np.stack(stft_channels, axis=0)  # (n_channels, n_freq, n_time)
         
         nyquist = sfreq / 2.0
         harmonics = np.arange(f_target, nyquist, f_target)
@@ -475,15 +699,17 @@ class ArtifactFilterFactory:
                     alpha = (f[idx] - upper_bound) / taper_width
                     gain_mask[idx] = 1.0 - (1.0 - attenuation_linear) * (0.5 * (1 + np.cos(np.pi * alpha)))
         
+        if len(harmonics) == 0:
+            return np.copy(data)
+
         # Apply gain to all STFT coefficients (across channels and time)
         Zxx_clean = Zxx * gain_mask[np.newaxis, :, np.newaxis]
         
-        # Inverse STFT
-        _, cleaned_data = signal.istft(Zxx_clean, fs=sfreq, nperseg=nperseg, axis=1)
-        
-        # Edge case: Istft might return a slightly larger array or smaller array due to padding
-        # Slice to the original exact size
-        cleaned_data = cleaned_data[:, :data.shape[1]]
+        # Inverse STFT per channel for SciPy compatibility.
+        cleaned_data = np.zeros_like(data)
+        for ch in range(data.shape[0]):
+            _, cleaned_ch = signal.istft(Zxx_clean[ch], fs=sfreq, nperseg=nperseg)
+            cleaned_data[ch, :min(data.shape[1], len(cleaned_ch))] = cleaned_ch[:data.shape[1]]
         
         return cleaned_data
 
@@ -505,6 +731,7 @@ class ArtifactFilterFactory:
             threshold_percentile: Percentile threshold for artifact detection (higher = more selective)
             chunk_sec: Chunk duration for STFT in seconds
         """
+        f_target = ArtifactFilterFactory._fold_to_nyquist(float(f_target), sfreq)
         print(f"Applying Zapline+ (Chen et al., 2022) - f={f_target}Hz, {n_harmonics} harmonics, "
               f"threshold={threshold_percentile}th percentile")
         
@@ -515,8 +742,16 @@ class ArtifactFilterFactory:
         if nperseg > n_samples:
             nperseg = n_samples
         
-        # Step 1: Decompose using STFT
-        f, t, Zxx = signal.stft(data, fs=sfreq, nperseg=nperseg, axis=1)
+        # Step 1: Decompose using STFT per channel for broad SciPy compatibility.
+        stft_channels = []
+        f = None
+        t = None
+        for ch in range(n_channels):
+            f_ch, t_ch, z_ch = signal.stft(data[ch], fs=sfreq, nperseg=nperseg)
+            if f is None:
+                f, t = f_ch, t_ch
+            stft_channels.append(z_ch)
+        Zxx = np.stack(stft_channels, axis=0)  # (n_channels, n_freq, n_time)
         
         nyquist = sfreq / 2.0
         harmonics = np.arange(f_target, min(nyquist, f_target * (n_harmonics + 1)), f_target)
@@ -570,8 +805,10 @@ class ArtifactFilterFactory:
                 # Fallback to simple spectral nulling if eigendecompositon fails
                 Zxx_clean[:, harmonic_bins, :] *= 0.5
         
-        # Inverse STFT
-        _, cleaned_data = signal.istft(Zxx_clean, fs=sfreq, nperseg=nperseg, axis=1)
-        cleaned_data = cleaned_data[:, :data.shape[1]]
+        # Inverse STFT per channel for SciPy compatibility.
+        cleaned_data = np.zeros_like(data)
+        for ch in range(n_channels):
+            _, cleaned_ch = signal.istft(Zxx_clean[ch], fs=sfreq, nperseg=nperseg)
+            cleaned_data[ch, :min(data.shape[1], len(cleaned_ch))] = cleaned_ch[:data.shape[1]]
         
         return cleaned_data

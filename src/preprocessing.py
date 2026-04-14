@@ -35,7 +35,7 @@ class EEGPreprocessor:
                  input_dir: Union[str, Path] = "data/XU/", 
                  output_dir: Union[str, Path] = "data/processed/",
                  l_freq: float = 1.0,
-                 h_freq: float = 70.0,
+                 h_freq: float = 110.0,
                  line_noise_freq: float = 60.0,
                  dbs_freqs: Optional[List[float]] = None,
                  generate_plots: bool = False,
@@ -60,7 +60,8 @@ class EEGPreprocessor:
         self.l_freq = l_freq
         self.h_freq = h_freq
         self.line_noise_freq = line_noise_freq
-        self.dbs_freqs = dbs_freqs or [130.0, 160.0]
+        # Database constraint: all DBS processing frequencies must remain below 120 Hz.
+        self.dbs_freqs = dbs_freqs or [7.0, 60.0, 100.0]
         self.generate_plots = generate_plots
         self.plot_intermediate = plot_intermediate
         self.plot_dir = Path(plot_dir)
@@ -146,9 +147,14 @@ class EEGPreprocessor:
         Returns:
             mne.io.Raw: Bandpass filtered MNE Raw object.
         """
-        print(f"Applying zero-phase FIR bandpass filter: {self.l_freq} - {self.h_freq} Hz")
+        nyquist = raw.info['sfreq'] / 2.0
+        h_freq_eff = min(self.h_freq, 119.0, nyquist - 0.5)
+        if h_freq_eff <= self.l_freq:
+            h_freq_eff = max(self.l_freq + 0.5, nyquist - 0.5)
+
+        print(f"Applying zero-phase FIR bandpass filter: {self.l_freq} - {h_freq_eff} Hz")
         # FIR design 'firwin' and phase='zero' are typically MNE defaults, explicitly enforced here
-        raw.filter(l_freq=self.l_freq, h_freq=self.h_freq, 
+        raw.filter(l_freq=self.l_freq, h_freq=h_freq_eff,
                    fir_design='firwin', phase='zero', verbose='WARNING')
         return raw
         
@@ -166,6 +172,7 @@ class EEGPreprocessor:
         # Nyquist frequency specifies the maximum resolvable frequency
         sfreq = raw.info['sfreq']
         nyquist = sfreq / 2.0
+        max_freq = min(119.0, nyquist - 0.5)
         
         target_freqs = []
         
@@ -184,10 +191,12 @@ class EEGPreprocessor:
 
         # Generate harmonics up to the Nyquist limit for each targeted DBS artifact baseline frequency
         for dbs_f in dynamic_dbs_freqs:
+            if dbs_f <= 0:
+                continue
             target_freqs.extend(np.arange(dbs_f, nyquist, dbs_f))
             
         # Convert to a unique, sorted list of frequencies to filter
-        target_freqs = sorted(list(set(target_freqs)))
+        target_freqs = sorted([f for f in set(target_freqs) if 0 < f < max_freq])
 
         # MNE requires sufficient separation between adjacent notch stop bands.
         # Each notch of width `notch_widths` also needs a transition band on each side.
@@ -383,7 +392,7 @@ class EEGPreprocessor:
         try:
             # Use fmax = min(Nyquist, 200 Hz) to efficiently capture the relevant DBS frequencies (130-160 Hz)
             sfreq = raw.info['sfreq']
-            fmax = min(sfreq / 2.0, 200.0)
+            fmax = min(sfreq / 2.0, 119.0)
             
             # compute_psd is the modern interface in MNE >= 1.3
             fig = raw.compute_psd(fmax=fmax).plot(show=False)
@@ -475,9 +484,9 @@ if __name__ == "__main__":
         input_dir="data/XU/", 
         output_dir="data/processed/",
         l_freq=1.0,
-        h_freq=70.0,
+        h_freq=110.0,
         line_noise_freq=60.0,
-        dbs_freqs=[130.0, 160.0],
+        dbs_freqs=[7.0, 60.0, 100.0],
         generate_plots=True,
         plot_intermediate=True
     )
