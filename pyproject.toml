@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "ml-driven-eeg-biomarkers"
+version = "0.1.0"
+description = "ML-driven EEG biomarkers — modular DBS artifact removal pipeline"
+requires-python = ">=3.10"
+
+dependencies = [
+    # ── Dagster orchestration ─────────────────────────────────────────
+    "dagster>=1.7",
+    "dagster-webserver>=1.7",   # Dagster UI
+    # ── EEG processing ────────────────────────────────────────────────
+    "mne>=1.6",
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "matplotlib>=3.7",
+    # ── Data / general ────────────────────────────────────────────────
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "jupyter",
+    "jupyterlab",
+    "ipykernel",
+    "pytest>=7",
+    "pytest-dagster",           # Dagster test utilities
+]
+cloud = [
+    "dagster-cloud>=1.7",       # Dagster+ cloud agent
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pipeline*", "src*"]
+
+# ── Dagster-specific tool config ──────────────────────────────────────────────
+[tool.dagster]
+module_name = "pipeline"
+attribute   = "defs"

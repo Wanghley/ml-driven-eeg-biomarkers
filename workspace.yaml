@@ -1,0 +1,10 @@
+# Dagster workspace configuration
+# Run `dagster dev` from the project root to launch the UI at http://localhost:3000
+#
+# This file tells Dagster where to find the pipeline code.
+# The `pipeline` Python package (pipeline/__init__.py) contains the `defs` Definitions object.
+
+load_from:
+  - python_package:
+      package_name: pipeline
+      attribute: defs
