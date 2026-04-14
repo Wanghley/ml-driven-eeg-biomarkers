@@ -645,3 +645,75 @@ def real_ica_pipeline(
 
     context.log.info("real_ica_pipeline complete — all figures saved.")
     return MaterializeResult(metadata=metadata)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Asset 4 — Export final cleaned signals as EDF files
+# ──────────────────────────────────────────────────────────────────────────────
+
+@asset(
+    group_name="real_data",
+    description=(
+        "Export the final pipeline-cleaned AWAKE7 and SLEEP7 signals as EDF files. "
+        "Also exports DBS-only-removed (pre-ICA) variants for comparison. "
+        "EDF files are written to data/processed/edf/."
+    ),
+)
+def real_edf_export(
+    context: AssetExecutionContext,
+    real_raw_loaded: dict,
+    real_dbs_filtered: dict,
+    real_ica_pipeline: None,
+    eeg_config: EEGPipelineConfig,
+) -> Output:
+    """
+    Reads the saved .fif files from upstream assets and writes EDF files.
+
+    Returns
+    -------
+    dict
+        Mapping of label → absolute EDF path for all exported files.
+    """
+    import mne.export  # noqa: F401  (ensures export API is available)
+
+    proc = eeg_config.processed_path()
+    edf_dir = proc / "edf"
+    edf_dir.mkdir(parents=True, exist_ok=True)
+
+    best = eeg_config.best_method
+
+    to_export = {
+        "raw_awake7":       real_raw_loaded["awake7_path"],
+        "raw_sleep7":       real_raw_loaded["sleep7_path"],
+        "raw_pre_awake":    real_raw_loaded["pre_awake_path"],
+        "raw_pre_sleep":    real_raw_loaded["pre_sleep_path"],
+        f"dbs_removed_awake7": real_dbs_filtered["awake_fif_paths"][best],
+        f"dbs_removed_sleep7": real_dbs_filtered["sleep_fif_paths"][best],
+        "final_clean_awake7":  str(proc / "real_awake_final_clean.fif"),
+        "final_clean_sleep7":  str(proc / "real_sleep_final_clean.fif"),
+    }
+
+    exported: dict[str, str] = {}
+    for label, fif_path in to_export.items():
+        p = pathlib.Path(fif_path)
+        if not p.exists():
+            context.log.warning(f"Skipping {label}: {fif_path} not found")
+            continue
+        raw = _raw_from_fif(fif_path)
+        out_edf = edf_dir / f"{label}.edf"
+        # MNE export requires physical_range to be set; use data min/max
+        raw.export(str(out_edf), fmt="edf", physical_range="auto", overwrite=True, verbose=False)
+        exported[label] = str(out_edf)
+        size_mb = out_edf.stat().st_size / 1_048_576
+        context.log.info(f"Exported {label} → {out_edf.name}  ({size_mb:.1f} MB)")
+
+    return Output(
+        value=exported,
+        metadata={
+            label: MetadataValue.path(path)
+            for label, path in exported.items()
+        } | {
+            "n_files_exported": MetadataValue.int(int(len(exported))),
+            "edf_directory": MetadataValue.path(str(edf_dir)),
+        },
+    )

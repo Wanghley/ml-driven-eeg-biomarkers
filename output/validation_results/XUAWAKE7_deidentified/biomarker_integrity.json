@@ -1,0 +1,38 @@
+{
+  "Delta": {
+    "baseline_uV2": 358.698,
+    "final_uV2": 127.026,
+    "preservation_%": 35.41,
+    "goal_met (>90%)": false
+  },
+  "Theta": {
+    "baseline_uV2": 64.299,
+    "final_uV2": 108.937,
+    "preservation_%": 169.42,
+    "goal_met (>90%)": true
+  },
+  "Alpha": {
+    "baseline_uV2": 90.144,
+    "final_uV2": 48.574,
+    "preservation_%": 53.88,
+    "goal_met (>90%)": false
+  },
+  "Beta": {
+    "baseline_uV2": 47.932,
+    "final_uV2": 46.428,
+    "preservation_%": 96.86,
+    "goal_met (>90%)": true
+  },
+  "Gamma": {
+    "baseline_uV2": 2.466,
+    "final_uV2": 15.74,
+    "preservation_%": 638.26,
+    "goal_met (>90%)": true
+  },
+  "DBS_removal": {
+    "harmonic_power_raw_uV2": 1156.882,
+    "harmonic_power_final_uV2": 37.377,
+    "reduction_%": 96.77,
+    "goal_met (>90%)": true
+  }
+}

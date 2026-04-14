@@ -458,3 +458,67 @@ def synthetic_ica_pipeline(
             "Final PSD":              _png_md(psd_fig),
         }
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Asset 4 — Export synthetic pipeline signals as EDF files
+# ──────────────────────────────────────────────────────────────────────────────
+
+@asset(
+    group_name="synthetic",
+    description=(
+        "Export synthetic pipeline signals (contaminated, best DBS-removed, final clean, "
+        "and brain reference) as EDF files for external analysis or viewer."
+    ),
+)
+def synthetic_edf_export(
+    context: AssetExecutionContext,
+    synthetic_signal: dict,
+    synthetic_dbs_filtered: dict,
+    synthetic_ica_pipeline: None,
+    eeg_config: EEGPipelineConfig,
+) -> Output:
+    """
+    Returns
+    -------
+    dict
+        Mapping of label → absolute EDF path for all exported files.
+    """
+    import mne.export  # noqa: F401
+
+    proc = eeg_config.processed_path()
+    edf_dir = proc / "edf"
+    edf_dir.mkdir(parents=True, exist_ok=True)
+
+    best = eeg_config.best_method
+
+    to_export = {
+        "synth_contaminated":   synthetic_signal["fif_path"],
+        "synth_brain_only":     synthetic_signal["brain_path"],
+        f"synth_dbs_removed":   synthetic_dbs_filtered["fif_paths"][best],
+        "synth_final_clean":    str(proc / "synth_final_clean.fif"),
+    }
+
+    exported: dict[str, str] = {}
+    for label, fif_path in to_export.items():
+        p = pathlib.Path(fif_path)
+        if not p.exists():
+            context.log.warning(f"Skipping {label}: {fif_path} not found")
+            continue
+        raw = _raw_from_fif(fif_path)
+        out_edf = edf_dir / f"{label}.edf"
+        raw.export(str(out_edf), fmt="edf", physical_range="auto", overwrite=True, verbose=False)
+        exported[label] = str(out_edf)
+        size_mb = out_edf.stat().st_size / 1_048_576
+        context.log.info(f"Exported {label} → {out_edf.name}  ({size_mb:.1f} MB)")
+
+    return Output(
+        value=exported,
+        metadata={
+            label: MetadataValue.path(path)
+            for label, path in exported.items()
+        } | {
+            "n_files_exported": MetadataValue.int(int(len(exported))),
+            "edf_directory":    MetadataValue.path(str(edf_dir)),
+        },
+    )

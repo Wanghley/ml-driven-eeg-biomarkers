@@ -19,7 +19,7 @@ Or via workspace.yaml (recommended for deployment)::
 from dagster import Definitions, FilesystemIOManager
 
 from pipeline.assets import all_assets
-from pipeline.jobs import synthetic_job, real_data_job, full_eeg_pipeline
+from pipeline.jobs import synthetic_job, real_data_job, full_eeg_pipeline, export_edf_job
 from pipeline.resources import EEGPipelineConfig
 from pipeline.sensors import new_edf_sensor
 
@@ -29,6 +29,7 @@ defs = Definitions(
         synthetic_job,
         real_data_job,
         full_eeg_pipeline,
+        export_edf_job,
     ],
     resources={
         # Resource key must match the parameter name used in @asset functions
