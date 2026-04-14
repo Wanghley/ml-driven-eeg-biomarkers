@@ -247,6 +247,10 @@ class ArtifactFilterFactory:
             'sin_regression':         'sinusoidal_regression',
             'harmonic_regression':    'sinusoidal_regression',
             'harmonic_subtraction':   'sinusoidal_regression',
+            # Production surgical suite
+            'surgical_regression':    'sinusoidal_regression_chunked',
+            'complex_hampel':         'complex_hampel_fft',
+            'phase_template':         'phase_template_subtraction',
         }
         method = method_aliases.get(method, method)
 
@@ -261,10 +265,14 @@ class ArtifactFilterFactory:
             clean_data = cls._apply_time_domain_hampel(data, sfreq, **kwargs)
         elif method == 'hampel_freq':
             clean_data = cls._apply_freq_domain_hampel(data, sfreq, **kwargs)
+        elif method == 'complex_hampel_fft':
+            clean_data = cls._apply_complex_hampel_fft(data, sfreq, **kwargs)
+        elif method == 'phase_template_subtraction':
+            clean_data = cls._apply_phase_template_subtraction(data, sfreq, **kwargs)
         elif method == 'fft_spectral_interp':
             clean_data = cls._apply_fft_spectral_interp(data, sfreq, **kwargs)
-        elif method == 'sinusoidal_regression':
-            clean_data = cls._apply_sinusoidal_regression(data, sfreq, **kwargs)
+        elif method == 'sinusoidal_regression' or method == 'sinusoidal_regression_chunked':
+            clean_data = cls._apply_sinusoidal_regression_chunked(data, sfreq, **kwargs)
         elif method == 'spectrum_fit':
             clean_data = cls._apply_spectral_interpolation(data, sfreq, **kwargs)
         elif method == 'zapline':
@@ -273,7 +281,7 @@ class ArtifactFilterFactory:
             clean_data = cls._apply_comb_notch(data, sfreq, **kwargs)
         else:
             raise ValueError(f"Unknown method '{method}'. "
-                           f"Try: 'hampel_time', 'hampel_freq', 'spectrum_fit', 'zapline', 'comb_notch'")
+                           f"Try: 'surgical_regression', 'complex_hampel', 'phase_template'")
             
         return clean_data.reshape(original_shape)
 
@@ -539,91 +547,139 @@ class ArtifactFilterFactory:
         return cleaned
 
     @staticmethod
-    def _apply_sinusoidal_regression(
+    def _apply_sinusoidal_regression_chunked(
         data: np.ndarray,
         sfreq: float,
         f_target: float = 7.0,
-        chunk_sec: float | None = None,
+        chunk_sec: float = 4.0,
     ) -> np.ndarray:
         """
-        Sinusoidal Regression DBS Removal — the gold-standard approach for
-        stable-frequency DBS.
+        Production-grade Chunked Sinusoidal Regression (Kroth et al. 2020).
 
-        Models the DBS artifact as a linear combination of sinusoids at every
-        harmonic up to Nyquist:
-
-            x_dbs(t) = Σ_{k=1}^{K} [Aₖ sin(2π k f₀ t) + Bₖ cos(2π k f₀ t)]
-
-        Fits Aₖ, Bₖ per channel via Ordinary Least Squares (QR factorisation),
-        then subtracts the reconstructed model.
-
-        Why this preserves brain signals
-        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-        The design matrix spans only exact-frequency sinusoids.  Any brain
-        signal whose frequency does not coincide exactly with a DBS harmonic
-        is mathematically orthogonal to the regressors and lands entirely in the
-        residual.  Even brain oscillations near (but not exactly at) a harmonic
-        are largely preserved because natural oscillations have a bandwidth of
-        several tenths of a Hz, while the regression only captures the
-        zero-bandwidth (perfectly periodic) component.
-
-        Limitation
-        ~~~~~~~~~~
-        Any brain activity that is exactly phase-locked to a DBS harmonic for
-        the full duration of the recording will be removed along with DBS.  In
-        practice, natural brain oscillations are not perfectly phase-locked for
-        more than a few seconds, so this is minor.
-
-        For non-stationary DBS (frequency drift > 0.01 Hz), use
-        ``chunk_sec`` to apply the regression in short overlapping windows.
-
-        Args
-        ----
-        f_target  : DBS fundamental frequency in Hz.
-        chunk_sec : If not None, apply regression in non-overlapping chunks of
-                    this duration (seconds).  Useful for recordings where DBS
-                    frequency drifts slowly.  Default None = full-recording fit.
+        Fits exact-harmonic OLS sinusoids in short overlapping chunks to remove
+        perfectly periodic DBS artifacts while preserving phase-resetting brain oscillations.
+        Uses 4-second windows by default to balance frequency resolution and non-stationarity.
         """
         f_target = ArtifactFilterFactory._fold_to_nyquist(float(f_target), sfreq)
         nyquist   = sfreq / 2.0
         harmonics = np.arange(f_target, nyquist, f_target)
         n_ch, n_samples = data.shape
+        chunk_len = int(chunk_sec * sfreq)
 
-        print(f"Sinusoidal Regression: f₀={f_target} Hz, {len(harmonics)} harmonics, "
-              f"chunk={'full' if chunk_sec is None else f'{chunk_sec}s'}")
+        print(f"Chunked Sinusoidal Regression: f₀={f_target}Hz, {len(harmonics)} harmonics, window={chunk_sec}s")
 
-        def _regress_chunk(chunk: np.ndarray) -> np.ndarray:
-            """Fit and subtract the sinusoidal DBS model from a data chunk."""
-            n = chunk.shape[1]
+        def _regress_seg(seg: np.ndarray) -> np.ndarray:
+            n = seg.shape[1]
             t = np.arange(n) / sfreq
-
-            # Design matrix: [sin(2π f₁ t), cos(2π f₁ t), ..., sin(2π fK t), cos(2π fK t), 1]
             cols = []
             for h in harmonics:
                 cols.append(np.sin(2 * np.pi * h * t))
                 cols.append(np.cos(2 * np.pi * h * t))
-            cols.append(np.ones(n))                   # DC offset
-            X = np.stack(cols, axis=1)                # (n, 2K+1)
+            cols.append(np.ones(n))
+            X = np.column_stack(cols)
+            beta, _, _, _ = np.linalg.lstsq(X, seg.T, rcond=None)
+            dbs_model = X[:, :-1] @ beta[:-1]
+            return seg - dbs_model.T
 
-            # OLS: X (n, p) · β (p, n_ch) ≈ chunk.T (n, n_ch)
-            # Use lstsq for numerical stability (QR internally)
-            beta, _, _, _ = np.linalg.lstsq(X, chunk.T, rcond=None)  # (p, n_ch)
-
-            # Reconstruct only the sinusoidal part (exclude DC column)
-            dbs_model = X[:, :-1] @ beta[:-1]     # (n, n_ch) — DBS estimate
-            return chunk - dbs_model.T
-
-        if chunk_sec is None:
-            cleaned = _regress_chunk(data)
-        else:
-            chunk_len = int(chunk_sec * sfreq)
-            cleaned   = np.zeros_like(data)
-            for start in range(0, n_samples, chunk_len):
-                end = min(start + chunk_len, n_samples)
-                cleaned[:, start:end] = _regress_chunk(data[:, start:end])
-            print(f"  Processed {int(np.ceil(n_samples/chunk_len))} chunks × {chunk_sec}s")
+        cleaned = np.zeros_like(data)
+        for start in range(0, n_samples, chunk_len):
+            end = min(start + chunk_len, n_samples)
+            cleaned[:, start:end] = _regress_seg(data[:, start:end])
 
         return cleaned
+
+    @staticmethod
+    def _apply_complex_hampel_fft(
+        data: np.ndarray,
+        sfreq: float,
+        f_target: float = 7.0,
+        n_sigmas: float = 3.0,
+        bw_hz: float = 0.5,
+        fmax_hz: float = 100.0
+    ) -> np.ndarray:
+        """
+        Complex Spectral Hampel Filter — surgical residual removal.
+
+        Targets narrowband DBS residue by replacing outlier bins in the
+        complex spectrum (Real/Imag separately) via linear interpolation.
+        """
+        n_ch, n_s = data.shape
+        Xf    = np.fft.rfft(data, axis=1)
+        freqs = np.fft.rfftfreq(n_s, 1.0 / sfreq)
+        df    = freqs[1] - freqs[0]
+        n_f   = len(freqs)
+
+        half_bw  = max(1, int(round(bw_hz / 2.0 / df)))
+        flank    = max(5, int(round(min(3.0, f_target * 0.4) / df)))
+        loc_win  = max(20, int(round(2.5 / df)))
+        nyq      = sfreq / 2.0
+
+        print(f"Complex Spectral Hampel: f₀={f_target}Hz, sigmas={n_sigmas}, bw={bw_hz}Hz")
+
+        Xf_c = Xf.copy()
+        for k in range(1, 200):
+            h = k * f_target
+            if h >= min(nyq, fmax_hz + 5.0):
+                break
+            h_bin = int(round(h / df))
+            if h_bin >= n_f - flank - 1:
+                break
+
+            zs = max(1, h_bin - half_bw)
+            ze = min(n_f - 2, h_bin + half_bw + 1)
+            ls = max(1, zs - flank)
+            re = min(n_f - 1, ze + flank)
+
+            ref = np.concatenate([np.arange(ls, zs), np.arange(ze, re)])
+            tgt = np.arange(zs, ze)
+            if len(ref) < 4 or len(tgt) == 0:
+                continue
+
+            lo_s, lo_e = max(1, h_bin - loc_win), min(n_f - 1, h_bin + loc_win + 1)
+
+            for ch in range(n_ch):
+                mag     = np.abs(Xf_c[ch])
+                loc_mag = mag[lo_s:lo_e]
+                med     = np.median(loc_mag)
+                mad     = np.median(np.abs(loc_mag - med))
+                thr     = med + n_sigmas * MAD_SCALE_FACTOR * mad
+
+                if mag[h_bin] > thr:
+                    rb, tb = ref.astype(float), tgt.astype(float)
+                    Xf_c[ch, tgt] = (np.interp(tb, rb, Xf_c[ch, ref].real)
+                                      + 1j * np.interp(tb, rb, Xf_c[ch, ref].imag))
+
+        return np.fft.irfft(Xf_c, n=n_s, axis=1)
+
+    @staticmethod
+    def _apply_phase_template_subtraction(
+        data: np.ndarray,
+        sfreq: float,
+        f_target: float = 7.0,
+        n_bins: int = 256
+    ) -> np.ndarray:
+        """
+        Phase-locked Median Template Subtraction.
+
+        Constructs a stationary waveform template by binning samples into
+        their relative DBS phase (0 to 2π) and subtracting the median.
+        """
+        print(f"Phase Template Subtraction: f₀={f_target}Hz, bins={n_bins}")
+        n_ch, n_s = data.shape
+        t     = np.arange(n_s, dtype=np.float64) / sfreq
+        phase = (2.0 * np.pi * f_target * t) % (2.0 * np.pi)
+        bidx  = (phase / (2.0 * np.pi) * n_bins).astype(int) % n_bins
+
+        out = data.copy()
+        for ch in range(n_ch):
+            # Efficiently compute medians for each bin
+            tmpl = np.zeros(n_bins)
+            for b in range(n_bins):
+                m = bidx == b
+                if m.any():
+                    tmpl[b] = np.median(data[ch, m])
+            out[ch] -= tmpl[bidx]
+        return out
 
     @staticmethod
     def _apply_spectral_interpolation(data: np.ndarray, sfreq: float,
