@@ -32,7 +32,17 @@ import mne
 
 mne.set_log_level("WARNING")
 
-from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue
+import base64
+from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue, Output
+
+
+# ── Helper: encode a saved PNG as base64 markdown for inline Dagster UI display ──
+def _png_md(path) -> MetadataValue:
+    with open(str(path), "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode()
+    name = pathlib.Path(str(path)).name
+    return MetadataValue.md(f"![{name}](data:image/png;base64,{b64})")
+
 
 from pipeline.resources import EEGPipelineConfig
 from pipeline.constants import BANDS, DBS_METHODS, METHOD_PALETTE, STANDARD_CH
@@ -121,7 +131,7 @@ def _classify_ica(ica: mne.preprocessing.ICA, raw: mne.io.Raw) -> tuple[list, li
 def synthetic_signal(
     context: AssetExecutionContext,
     eeg_config: EEGPipelineConfig,
-) -> dict:
+) -> Output:
     """
     Returns
     -------
@@ -141,7 +151,7 @@ def synthetic_signal(
         duration=eeg_config.synthetic_duration,
         seed=eeg_config.synthetic_seed,
     )
-    sig = gen.generate(f_dbs=eeg_config.dbs_freq, amplitude=eeg_config.synthetic_dbs_amplitude)
+    sig = gen.generate(dbs_freq=eeg_config.dbs_freq)
 
     # ── Save mixed (contaminated) signal ────────────────────────────────
     raw_mixed = gen.to_mne_raw(sig, "mixed")
@@ -162,7 +172,7 @@ def synthetic_signal(
         + ", ".join(f"{k}={v:.2f}" for k, v in rms.items())
     )
 
-    return {
+    value = {
         "fif_path":   str(fif_path),
         "brain_path": str(brain_path),
         "sfreq":      float(sig["sfreq"]),
@@ -171,6 +181,16 @@ def synthetic_signal(
         "n_channels": int(len(sig["ch_names"])),
         "rms":        rms,
     }
+    return Output(
+        value=value,
+        metadata={
+            "n_channels":  MetadataValue.int(int(value["n_channels"])),
+            "duration_s":  MetadataValue.float(float(value["duration"])),
+            "dbs_freq_hz": MetadataValue.float(float(value["dbs_freq"])),
+            "brain_rms_uv":MetadataValue.float(float(round(rms["brain"], 2))),
+            "dbs_rms_uv":  MetadataValue.float(float(round(rms["dbs"],   2))),
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,7 +210,7 @@ def synthetic_dbs_filtered(
     context: AssetExecutionContext,
     synthetic_signal: dict,
     eeg_config: EEGPipelineConfig,
-) -> dict:
+) -> Output:
     """
     Returns
     -------
@@ -288,12 +308,23 @@ def synthetic_dbs_filtered(
 
     context.log.info(f"Saved figures: {psd_fig}, {bar_fig}")
 
-    return {
+    value = {
         "fif_paths":   fif_paths,
         "metrics":     metrics,
         "figure_psd":  str(psd_fig),
         "figure_bars": str(bar_fig),
     }
+    return Output(
+        value=value,
+        metadata={
+            "PSD comparison":  _png_md(psd_fig),
+            "Band preservation bars": _png_md(bar_fig),
+            "n_methods": MetadataValue.int(int(len(metrics))),
+            "best_theta_pct": MetadataValue.float(float(
+                max(m["Theta"] for m in metrics))
+            ),
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -416,15 +447,14 @@ def synthetic_ica_pipeline(
     return MaterializeResult(
         metadata={
             "best_method":            MetadataValue.text(best),
-            "n_components_excluded":  MetadataValue.int(len(all_bad)),
+            "n_components_excluded":  MetadataValue.int(int(len(all_bad))),
             "eye_components":         MetadataValue.text(str(eye_comps)),
             "muscle_components":      MetadataValue.text(str(muscle_comps)),
-            "clean_fif_path":         MetadataValue.path(str(clean_path)),
-            "figure_ica_topomaps":    MetadataValue.path(str(topo_fig)) if topo_fig else MetadataValue.text("none"),
-            "figure_final_psd":       MetadataValue.path(str(psd_fig)),
-            "delta_preservation_pct": MetadataValue.float(final_metrics["Delta"]),
-            "theta_preservation_pct": MetadataValue.float(final_metrics["Theta"]),
-            "alpha_preservation_pct": MetadataValue.float(final_metrics["Alpha"]),
-            "beta_preservation_pct":  MetadataValue.float(final_metrics["Beta"]),
+            "delta_preservation_pct": MetadataValue.float(float(final_metrics["Delta"])),
+            "theta_preservation_pct": MetadataValue.float(float(final_metrics["Theta"])),
+            "alpha_preservation_pct": MetadataValue.float(float(final_metrics["Alpha"])),
+            "beta_preservation_pct":  MetadataValue.float(float(final_metrics["Beta"])),
+            "ICA topomaps":           _png_md(topo_fig) if topo_fig else MetadataValue.text("no components excluded"),
+            "Final PSD":              _png_md(psd_fig),
         }
     )

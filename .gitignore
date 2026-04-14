@@ -214,3 +214,29 @@ data/
 #Macos
 .DS_Store
 .AppleDouble
+# ── Dagster ────────────────────────────────────────────────────────────────────
+.dagster/                        # local instance storage (SQLite DB, runs, logs)
+dagster_home/                    # alternative DAGSTER_HOME location
+
+# ── Project: raw & processed EEG data ─────────────────────────────────────────
+data/raw/**/*.edf
+data/raw/**/*.edf+
+data/processed/**/*.fif          # intermediate MNE Raw files written by pipeline
+data/processed/**/*.pkl
+data/processed/**/*.npy
+data/processed/**/*.h5
+
+# ── Project: generated results ────────────────────────────────────────────────
+results/figures/**/*.png
+results/figures/**/*.jpg
+results/figures/**/*.pdf
+results/metrics/**/*.csv
+results/reports/**/*.html
+results/reports/**/*.pdf
+
+# ── Project: local / temporary ────────────────────────────────────────────────
+local_data/
+scratch/
+test_output/
+temp_analysis/
+notebooks/data/

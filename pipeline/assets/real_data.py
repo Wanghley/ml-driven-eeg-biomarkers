@@ -32,7 +32,16 @@ import mne
 
 mne.set_log_level("WARNING")
 
-from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue
+import base64
+from dagster import asset, AssetExecutionContext, MaterializeResult, MetadataValue, Output
+
+
+def _png_md(path) -> MetadataValue:
+    with open(str(path), "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode()
+    name = pathlib.Path(str(path)).name
+    return MetadataValue.md(f"![{name}](data:image/png;base64,{b64})")
+
 
 from pipeline.resources import EEGPipelineConfig
 from pipeline.constants import BANDS, DBS_METHODS, METHOD_PALETTE, STANDARD_CH
@@ -165,7 +174,7 @@ def _topomap_band(raw: mne.io.Raw, lo: float, hi: float, ax, title: str):
 def real_raw_loaded(
     context: AssetExecutionContext,
     eeg_config: EEGPipelineConfig,
-) -> dict:
+) -> Output:
     """
     Returns
     -------
@@ -195,8 +204,8 @@ def real_raw_loaded(
         raw.save(str(out), overwrite=True)
         paths[f"{key}_path"] = str(out)
         recording_info[key] = {
-            "duration_min": round(raw.times[-1] / 60, 2),
-            "sfreq":        raw.info["sfreq"],
+            "duration_min": float(round(raw.times[-1] / 60, 2)),
+            "sfreq":        float(raw.info["sfreq"]),
             "n_channels":   len(raw.ch_names),
         }
         context.log.info(
@@ -205,7 +214,17 @@ def real_raw_loaded(
             f"{recording_info[key]['n_channels']} ch"
         )
 
-    return {**paths, "recording_info": recording_info}
+    value = {**paths, "recording_info": recording_info}
+    return Output(
+        value=value,
+        metadata={
+            f"{k}_duration_min": MetadataValue.float(float(v["duration_min"]))
+            for k, v in recording_info.items()
+        } | {
+            f"{k}_sfreq": MetadataValue.float(float(v["sfreq"]))
+            for k, v in recording_info.items()
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -224,7 +243,7 @@ def real_dbs_filtered(
     context: AssetExecutionContext,
     real_raw_loaded: dict,
     eeg_config: EEGPipelineConfig,
-) -> dict:
+) -> Output:
     """
     Returns
     -------
@@ -383,7 +402,7 @@ def real_dbs_filtered(
     fig.savefig(str(fig_master), dpi=150, bbox_inches="tight")
     plt.close(fig)
 
-    return {
+    value = {
         "awake_fif_paths":  awake_fif,
         "sleep_fif_paths":  sleep_fif,
         "metrics_awake":    metrics_awake,
@@ -392,6 +411,20 @@ def real_dbs_filtered(
         "figure_psd_sleep": str(fig_psd_sl),
         "figure_master":    str(fig_master),
     }
+    return Output(
+        value=value,
+        metadata={
+            "AWAKE7 — PSD comparison":  _png_md(fig_psd_aw),
+            "SLEEP7 — PSD comparison":  _png_md(fig_psd_sl),
+            "Master comparison":        _png_md(fig_master),
+            "awake_best_theta_pct": MetadataValue.float(float(
+                max(m["Theta"] for m in metrics_awake))
+            ),
+            "sleep_best_theta_pct": MetadataValue.float(float(
+                max(m["Theta"] for m in metrics_sleep))
+            ),
+        },
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -595,12 +628,20 @@ def real_ica_pipeline(
     ]:
         for bname, lo, hi in BANDS:
             pct = 100 * _band_power(raw_clean_c, lo, hi) / (_band_power(raw_ref_c, lo, hi) + 1e-30)
-            metadata[f"{cond}_{bname.lower()}_pct"] = MetadataValue.float(round(pct, 1))
+            metadata[f"{cond}_{bname.lower()}_pct"] = MetadataValue.float(float(round(pct, 1)))
         for res_label, res_dict in results.items():
             if cond.upper() in res_label:
                 metadata[f"{cond}_ica_eye"]    = MetadataValue.text(str(res_dict["eye"]))
                 metadata[f"{cond}_ica_muscle"] = MetadataValue.text(str(res_dict["muscle"]))
-                metadata[f"{cond}_ica_excluded"] = MetadataValue.int(len(res_dict["bad"]))
+                metadata[f"{cond}_ica_excluded"] = MetadataValue.int(int(len(res_dict["bad"])))
+
+    # Embed figures inline for Dagster UI
+    metadata["ICA results"]      = _png_md(fig_ica)
+    metadata["Final PSD"]        = _png_md(fig_psd)
+    metadata["Band topomaps"]    = _png_md(fig_topo)
+    metadata["Master comparison"]= _png_md(
+        pathlib.Path(real_dbs_filtered["figure_master"])
+    )
 
     context.log.info("real_ica_pipeline complete — all figures saved.")
     return MaterializeResult(metadata=metadata)
