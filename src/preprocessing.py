@@ -60,11 +60,20 @@ class EEGPreprocessor:
         self.l_freq = l_freq
         self.h_freq = h_freq
         self.line_noise_freq = line_noise_freq
-        # Database constraint: all DBS processing frequencies must remain below 120 Hz.
+        # Default frequencies for DBS tracking
         self.dbs_freqs = dbs_freqs or [7.0, 60.0, 100.0]
         self.generate_plots = generate_plots
         self.plot_intermediate = plot_intermediate
         self.plot_dir = Path(plot_dir)
+        
+        # EEG band definitions for metrics
+        self.bands = [
+            ("Delta", 0.5,  4,  "#8c564b"),
+            ("Theta",  4,   8,  "#9467bd"),
+            ("Alpha",  8,  13,  "#1f77b4"),
+            ("Beta",  13,  30,  "#2ca02c"),
+            ("Gamma", 30, 100,  "#d62728"),
+        ]
         
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -136,25 +145,19 @@ class EEGPreprocessor:
         
         return raw
 
-    def apply_clinical_filter(self, raw: mne.io.Raw) -> mne.io.Raw:
+    def apply_clinical_filter(self, raw: mne.io.Raw, l_freq: Optional[float] = None, h_freq: Optional[float] = None) -> mne.io.Raw:
         """
-        Apply a zero-phase FIR bandpass filter. 
-        E.g., 1.0 Hz - 70.0 Hz to eliminate slow drifts and ultra-high frequency noise.
+        Apply a zero-phase FIR bandpass filter.
+        """
+        raw = raw.copy()
+        l_f = l_freq if l_freq is not None else self.l_freq
+        h_f = h_freq if h_freq is not None else self.h_freq
         
-        Args:
-            raw (mne.io.Raw): MNE Raw object to filter.
-            
-        Returns:
-            mne.io.Raw: Bandpass filtered MNE Raw object.
-        """
         nyquist = raw.info['sfreq'] / 2.0
-        h_freq_eff = min(self.h_freq, 119.0, nyquist - 0.5)
-        if h_freq_eff <= self.l_freq:
-            h_freq_eff = max(self.l_freq + 0.5, nyquist - 0.5)
-
-        print(f"Applying zero-phase FIR bandpass filter: {self.l_freq} - {h_freq_eff} Hz")
-        # FIR design 'firwin' and phase='zero' are typically MNE defaults, explicitly enforced here
-        raw.filter(l_freq=self.l_freq, h_freq=h_freq_eff,
+        h_freq_eff = min(h_f, 119.0, nyquist - 0.5)
+        
+        print(f"Applying zero-phase FIR bandpass filter: {l_f} - {h_freq_eff} Hz")
+        raw.filter(l_freq=l_f, h_freq=h_freq_eff,
                    fir_design='firwin', phase='zero', verbose='WARNING')
         return raw
         
@@ -381,6 +384,87 @@ class EEGPreprocessor:
                                               window_hz=window_hz,
                                               n_sigmas=n_sigmas,
                                               attenuation_db=attenuation_db)
+
+    def apply_surgical_pipeline(self, raw: mne.io.Raw, f_dbs: float, 
+                                 target_sfreq: float = 256.0, 
+                                 run_ica: bool = True) -> mne.io.Raw:
+        """
+        Full surgical DBS removal pipeline implementation.
+        
+        Stage I: Foundation (Standard Preprocessing)
+        Stage II: Hybrid Surgical Suite (Non-stationary regression + Phase Template)
+        Stage III: Automated ICA (Artifact rejection)
+        """
+        print(f"--- Starting Surgical Pipeline (f0={f_dbs} Hz) ---")
+        
+        # 1. Standard Preprocessing (Stage I)
+        raw_pre = self.standardize_channels(raw)
+        
+        # HPF/LPF/Notch
+        raw_pre = self.apply_clinical_filter(raw_pre, l_freq=0.1, h_freq=100.0)
+        
+        # Line Noise Notch
+        nyq = raw_pre.info['sfreq'] / 2.0
+        notch_freqs = sorted([f for f in np.arange(60.0, nyq, 60.0) if f < 105.0])
+        if notch_freqs:
+            raw_pre.notch_filter(freqs=notch_freqs, method='fir', phase='zero', verbose=False)
+            
+        # 2. Surgical Removal (Stage II)
+        data = raw_pre.get_data() * 1e6 # Convert to µV for stability
+        sfreq = raw_pre.info['sfreq']
+        
+        # Chunked Sinusoidal Regression
+        data = ArtifactFilterFactory.process('surgical_regression', data, sfreq, f_target=f_dbs)
+        # Complex Hampel
+        data = ArtifactFilterFactory.process('complex_hampel', data, sfreq, f_target=f_dbs)
+        # Phase Template
+        data = ArtifactFilterFactory.process('phase_template', data, sfreq, f_target=f_dbs)
+        
+        raw_surg = raw_pre.copy()
+        raw_surg._data = data * 1e-6
+        
+        # 3. ICA (Stage III)
+        if run_ica:
+            print("Applying Automated ICA Rejection...")
+            # We keep ICA logic here or in a helper
+            from mne.preprocessing import ICA
+            ica = ICA(n_components=15, method='fastica', random_state=42)
+            ica.fit(raw_surg, verbose=False)
+            
+            # This logic is quite specific to the research, 
+            # we'll use the simplified version or port the whole helper.
+            # For brevity in src/, let's assume raw_surg is returned if ICA rejected.
+            raw_surg = self._apply_automated_ica(raw_surg, ica, f_dbs)
+            
+        return raw_surg
+
+    def _apply_automated_ica(self, raw: mne.io.Raw, ica: mne.preprocessing.ICA, f_dbs: float) -> mne.io.Raw:
+        """Internal helper for Stage III ICA rejection."""
+        # Porting the SNR-based rejection logic from pipeline.py
+        sfreq = raw.info['sfreq']
+        src = ica.get_sources(raw).get_data()
+        n_comp = src.shape[0]
+        
+        reject = []
+        nyq = sfreq / 2.0
+        harmonics = np.arange(f_dbs, min(nyq, 105.0), f_dbs)
+        
+        for ic in range(n_comp):
+            fw, psd = sp_signal.welch(src[ic], fs=sfreq, nperseg=1024)
+            
+            harm_mask = np.zeros(len(fw), dtype=bool)
+            for h in harmonics:
+                harm_mask |= (fw >= h - 0.4) & (fw <= h + 0.4)
+            nonharm_mask = (fw >= 1.0) & (fw <= 100.0) & ~harm_mask
+            
+            if harm_mask.any() and nonharm_mask.any():
+                snr = psd[harm_mask].mean() / (np.median(psd[nonharm_mask]) + 1e-30)
+                if snr > 3.0:
+                    reject.append(ic)
+                    
+        ica.exclude = reject[:4] # Cap at 4
+        ica.apply(raw, verbose=False)
+        return raw
 
     def _save_plot(self, raw: mne.io.Raw, title: str, save_path: Path):
         """
