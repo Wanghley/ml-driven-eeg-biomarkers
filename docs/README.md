@@ -7,21 +7,23 @@ Comprehensive guides, API references, and usage documentation for the ML-Driven 
 ```
 docs/
 ├── README.md (this file)
-├── API-REFERENCE.md            # Complete API documentation
-├── guides/                      # How-to guides and tutorials
-│   ├── CLI-GUIDE.md            # Command-line interface guide
-│   ├── CLI-QUICK-REFERENCE.md  # Quick CLI reference
+├── API-REFERENCE.md                  # Complete API documentation
+├── PIPELINE-VALIDATION-REPORT.md    # ← Validation results, conclusions & lit. comparison
+├── guides/                            # How-to guides and tutorials
+│   ├── CLI-GUIDE.md                  # Command-line interface guide
+│   ├── CLI-QUICK-REFERENCE.md        # Quick CLI reference
 │   ├── DBS-ARTIFACT-REMOVAL-METHODS.md  # Detailed method explanations
 │   ├── QUICK-START-DBS-REMOVAL.md       # Quick start examples
 │   └── VISUAL-METHOD-COMPARISON.md      # Visual comparisons
-├── images/                      # Documentation images and diagrams
-└── presentation/                # Presentation materials
+├── images/                            # Documentation images and diagrams
+└── presentation/                      # Presentation materials
 ```
 
 ## Quick Navigation
 
 | Need | Document |
 |------|----------|
+| **Pipeline results & why they're good** | [**PIPELINE-VALIDATION-REPORT.md**](PIPELINE-VALIDATION-REPORT.md) |
 | Get started quickly | [QUICK-START-DBS-REMOVAL.md](guides/QUICK-START-DBS-REMOVAL.md) |
 | Detailed method info | [DBS-ARTIFACT-REMOVAL-METHODS.md](guides/DBS-ARTIFACT-REMOVAL-METHODS.md) |
 | API details | [API-REFERENCE.md](API-REFERENCE.md) |
