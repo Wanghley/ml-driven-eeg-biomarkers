@@ -102,6 +102,29 @@ BANDS = [
     ("Gamma", 30, 100,  "#d62728"),
 ]
 
+# Plot theme palettes — passed to every plot function; default is dark.
+_DARK: dict = {
+    "bg":         "#0e1117",
+    "legend_bg":  "#1c1f26",
+    "grid":       "#2a2a3a",
+    "spine":      "#444455",
+    "spine2":     "#555555",
+    "text":       "white",
+    "dbs_marker": "#f9c74f",
+    "ref_zero":   "white",
+}
+_LIGHT: dict = {
+    "bg":         "#ffffff",
+    "legend_bg":  "#f8f8f8",
+    "grid":       "#e0e0e0",
+    "spine":      "#aaaaaa",
+    "spine2":     "#999999",
+    "text":       "#111111",
+    "dbs_marker": "#c07c00",
+    "ref_zero":   "#333333",
+}
+THEMES: dict[str, dict] = {"dark": _DARK, "light": _LIGHT}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Core Pipeline Execution
 # ─────────────────────────────────────────────────────────────────────────────
