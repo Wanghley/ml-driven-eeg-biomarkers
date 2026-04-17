@@ -1,58 +1,58 @@
 {
   "Delta": {
     "baseline_uV2": 351.906,
-    "final_uV2": 108.964,
-    "preservation_%": 30.96,
+    "final_uV2": 109.63,
+    "preservation_%": 31.15,
     "off_harmonic_baseline_uV2": 351.906,
-    "off_harmonic_final_uV2": 108.964,
-    "off_harmonic_preservation_%": 30.96,
+    "off_harmonic_final_uV2": 109.63,
+    "off_harmonic_preservation_%": 31.15,
     "comparison_reliable": true,
     "goal_met (>90%)": false
   },
   "Theta": {
     "baseline_uV2": 82.449,
-    "final_uV2": 92.574,
-    "preservation_%": 112.28,
+    "final_uV2": 83.077,
+    "preservation_%": 100.76,
     "off_harmonic_baseline_uV2": 81.949,
-    "off_harmonic_final_uV2": 87.607,
-    "off_harmonic_preservation_%": 106.9,
+    "off_harmonic_final_uV2": 88.357,
+    "off_harmonic_preservation_%": 107.82,
     "comparison_reliable": true,
     "goal_met (>90%)": true
   },
   "Alpha": {
     "baseline_uV2": 80.753,
-    "final_uV2": 41.409,
-    "preservation_%": 51.28,
+    "final_uV2": 41.633,
+    "preservation_%": 51.56,
     "off_harmonic_baseline_uV2": 80.753,
-    "off_harmonic_final_uV2": 41.409,
-    "off_harmonic_preservation_%": 51.28,
+    "off_harmonic_final_uV2": 41.633,
+    "off_harmonic_preservation_%": 51.56,
     "comparison_reliable": true,
     "goal_met (>90%)": false
   },
   "Beta": {
     "baseline_uV2": 20.885,
-    "final_uV2": 44.295,
-    "preservation_%": 212.09,
+    "final_uV2": 40.784,
+    "preservation_%": 195.28,
     "off_harmonic_baseline_uV2": 20.743,
-    "off_harmonic_final_uV2": 44.71,
-    "off_harmonic_preservation_%": 215.54,
+    "off_harmonic_final_uV2": 44.772,
+    "off_harmonic_preservation_%": 215.84,
     "comparison_reliable": true,
     "goal_met (>90%)": true
   },
   "Gamma": {
     "baseline_uV2": 1.021,
-    "final_uV2": 14.909,
-    "preservation_%": 1460.11,
+    "final_uV2": 12.283,
+    "preservation_%": 1202.92,
     "off_harmonic_baseline_uV2": 1.024,
-    "off_harmonic_final_uV2": 12.741,
-    "off_harmonic_preservation_%": 1243.63,
+    "off_harmonic_final_uV2": 12.688,
+    "off_harmonic_preservation_%": 1238.47,
     "comparison_reliable": false,
     "goal_met (>90%)": true
   },
   "DBS_removal": {
     "harmonic_power_raw_uV2": 1157.88,
-    "harmonic_power_final_uV2": 43.633,
-    "reduction_%": 96.23,
+    "harmonic_power_final_uV2": 27.433,
+    "reduction_%": 97.63,
     "goal_met (>90%)": true
   }
 }
