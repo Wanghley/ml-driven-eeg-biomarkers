@@ -1,4 +1,4 @@
-name: eeg_thesis_v1
+name: ml-eeg-biomarkers
 channels:
   - pytorch
   - conda-forge

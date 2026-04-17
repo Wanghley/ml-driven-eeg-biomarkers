@@ -1,4 +1,3 @@
-import os
 import re
 from pathlib import Path
 from typing import List, Optional, Union
@@ -8,6 +7,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from src.filters import ArtifactFilterFactory, BaselineReferencedFilter
+from src.ingestion import (
+    IngestionConfig,
+    load_edf,
+    normalize_channel_names,
+    classify_channels,
+    STANDARD_1020,
+)
 
 class EEGPreprocessor:
     """
@@ -23,13 +29,8 @@ class EEGPreprocessor:
     - Exporting: Saving to MNE's native `.fif` format.
     """
     
-    # Core 10-20 system EEG channels. We exclude ECG, EOG, and auxiliary channels.
-    STANDARD_1020_CHANNELS = [
-        'Fp1', 'Fp2', 'F7', 'F3', 'Fz', 'F4', 'F8', 
-        'T3', 'C3', 'Cz', 'C4', 'T4', 
-        'T5', 'P3', 'Pz', 'P4', 'T6', 
-        'O1', 'O2'
-    ]
+    # Delegate to ingestion module for the canonical channel list.
+    STANDARD_1020_CHANNELS = STANDARD_1020
 
     def __init__(self, 
                  input_dir: Union[str, Path] = "data/XU/", 
@@ -81,68 +82,50 @@ class EEGPreprocessor:
             self.plot_dir.mkdir(parents=True, exist_ok=True)
 
     def find_edf_files(self) -> List[Path]:
-        """
-        Recursively find all .edf files in the input directory.
-        
-        Returns:
-            List[Path]: A list of file paths pointing to the .edf files.
-        """
-        # Look for lowercase extension
-        edf_files = list(self.input_dir.rglob("*.edf"))
-        # Also include uppercase extension just in case
-        edf_files.extend(list(self.input_dir.rglob("*.EDF")))
-        
-        # Remove duplicates
-        unique_files = list(set(edf_files))
-        return unique_files
+        """Recursively find all EDF files in the input directory."""
+        from src.ingestion import find_edf_files as _find
+        return _find(self.input_dir)
 
     def standardize_channels(self, raw: mne.io.Raw) -> mne.io.Raw:
-        """
-        Standardize channel names by stripping prefixes/suffixes. 
-        Drops dummy and ECG/EOG channels, keeping only standard 10-20 EEG channels.
-        
+        """Rename channels to standard 10-20 labels and type EEG/EOG/EMG explicitly.
+
+        EOG and EMG channels are preserved with correct MNE channel types so they
+        remain available for ICA-based artifact rejection. Only channels that cannot
+        be classified (e.g. ECG, status) are dropped.
+
         Args:
-            raw (mne.io.Raw): Unprocessed MNE Raw object.
-            
+            raw: MNE Raw object (may have clinical EDF channel names).
+
         Returns:
-            mne.io.Raw: MNE Raw object containing only standardized 10-20 channels.
+            MNE Raw object with typed EEG, EOG, and EMG channels.
         """
-        # Working with a copy to avoid unintended modifications
         raw = raw.copy()
-        
-        # Channel naming in clinical EDFs often comes with varied affixes 
-        # (e.g., "EEG Fp1-REF", "Fp1-LE", "Fp1"). We map these to standard names.
-        rename_mapping = {}
-        for ch_name in raw.ch_names:
-            for std_ch in self.STANDARD_1020_CHANNELS:
-                # Check for standard channel name within the original channel string,
-                # isolated by word boundaries or hyphens/spaces.
-                pattern = rf"\b{std_ch}\b|[^A-Za-z0-9]{std_ch}[^A-Za-z0-9]"
-                if re.search(pattern, ch_name, re.IGNORECASE) or std_ch.lower() == ch_name.lower().split('-')[0].split(' ')[-1]:
-                    rename_mapping[ch_name] = std_ch
-                    break
-                    
-        # Apply standard names to the mapped channels
-        if rename_mapping:
-            raw.rename_channels(rename_mapping)
-        
-        # Identify channels that successfully matched our 10-20 system list
-        ch_to_keep = [ch for ch in raw.ch_names if ch in self.STANDARD_1020_CHANNELS]
-        
-        if not ch_to_keep:
-            raise ValueError("No standard 10-20 channels could be identified in the EDF file.")
-            
-        # Drop all non-matching (dummy/ECG) channels
-        raw.pick(ch_to_keep)
-        
-        # Explicitly declare the remaining channels as EEG type to MNE
-        ch_types = {ch: 'eeg' for ch in ch_to_keep}
+
+        rename = normalize_channel_names(raw)
+        if rename:
+            raw.rename_channels(rename)
+
+        eeg_ch, eog_ch, emg_ch, _ = classify_channels(raw)
+
+        if not eeg_ch:
+            raise ValueError(
+                "No standard 10-20 EEG channels could be identified. "
+                f"Available channels: {raw.ch_names}"
+            )
+
+        # Keep EEG, EOG, and EMG; drop unclassified channels (ECG, status, etc.)
+        keep = eeg_ch + eog_ch + emg_ch
+        raw.pick(keep)
+
+        ch_types: dict[str, str] = {}
+        ch_types.update({ch: "eeg" for ch in eeg_ch})
+        ch_types.update({ch: "eog" for ch in eog_ch})
+        ch_types.update({ch: "emg" for ch in emg_ch})
         raw.set_channel_types(ch_types)
-        
-        # Standardize the physical locational montage mapping for plotting and source analysis
-        montage = mne.channels.make_standard_montage('standard_1020')
-        raw.set_montage(montage, match_case=False, on_missing='ignore')
-        
+
+        montage = mne.channels.make_standard_montage("standard_1020")
+        raw.set_montage(montage, match_case=False, on_missing="ignore")
+
         return raw
 
     def apply_clinical_filter(self, raw: mne.io.Raw, l_freq: Optional[float] = None, h_freq: Optional[float] = None) -> mne.io.Raw:
@@ -385,16 +368,24 @@ class EEGPreprocessor:
                                               n_sigmas=n_sigmas,
                                               attenuation_db=attenuation_db)
 
-    def apply_surgical_pipeline(self, raw: mne.io.Raw, f_dbs: float, 
-                                 target_sfreq: float = 256.0, 
+    def apply_surgical_pipeline(self, raw: mne.io.Raw, f_dbs: float,
+                                 target_sfreq: float = 256.0,
                                  run_ica: bool = True) -> mne.io.Raw:
+        """DEPRECATED — use src.artifact_removal.run_artifact_removal instead.
+
+        This method re-applies a bandpass filter and its own ICA, which causes
+        double-filtering when the caller has already filtered (High Priority #3
+        from the technical audit).  It is retained for backward-compatibility
+        only; new code must not call it.
         """
-        Full surgical DBS removal pipeline implementation.
-        
-        Stage I: Foundation (Standard Preprocessing)
-        Stage II: Hybrid Surgical Suite (Non-stationary regression + Phase Template)
-        Stage III: Automated ICA (Artifact rejection)
-        """
+        import warnings
+        warnings.warn(
+            "apply_surgical_pipeline is deprecated and will be removed. "
+            "Use src.artifact_removal.run_artifact_removal(), which avoids "
+            "double-filtering and uses EOG/EMG channels for ICA.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         print(f"--- Starting Surgical Pipeline (f0={f_dbs} Hz) ---")
         
         # 1. Standard Preprocessing (Stage I)
@@ -501,17 +492,15 @@ class EEGPreprocessor:
         """
         try:
             print(f"---\nProcessing: {filepath}")
-            # Preload is necessary as time-domain filtering requires data to be loaded in memory
-            raw = mne.io.read_raw_edf(filepath, preload=True, verbose='WARNING')
-            
+            result = load_edf(filepath, IngestionConfig(verbose="WARNING"))
+            raw = result.raw
+
             # Prepare plotting directory for this specific file
             file_plot_dir = self.plot_dir / filepath.stem
             if self.generate_plots:
                 file_plot_dir.mkdir(parents=True, exist_ok=True)
-            
-            # Application flow:
-            # 1. Clean up montage and retain EEG only
-            raw = self.standardize_channels(raw)
+
+            # load_edf already typed and renamed all channels; skip standardize_channels
             
             if self.generate_plots:
                 self._save_plot(raw, "PSD - 1. Standardized raw (Before Filtering)", file_plot_dir / "01_before_filtering.png")
