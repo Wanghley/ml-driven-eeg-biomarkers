@@ -431,30 +431,55 @@ class EEGPreprocessor:
         return raw_surg
 
     def _apply_automated_ica(self, raw: mne.io.Raw, ica: mne.preprocessing.ICA, f_dbs: float) -> mne.io.Raw:
-        """Internal helper for Stage III ICA rejection."""
-        # Porting the SNR-based rejection logic from pipeline.py
+        """Internal helper for Stage III ICA rejection.
+
+        Only the single most DBS-locked component (if any) is removed.
+        SNR threshold is intentionally high (10.0) to guarantee we never
+        reject a brain-activity component:
+
+        Rationale
+        ----------
+        * ICA mixes DBS artifact AND brain signal into each component.
+          Even "DBS components" carry delta / alpha variance — removing two
+          components was destroying 26-55 % of delta and alpha power.
+        * The Allen Hampel FFT has already removed the spectral spikes.
+          ICA here is a final residual-cleanup pass, not the primary
+          removal stage.  One component at high confidence is enough.
+        * SNR > 10 means harmonic power is ≥10× the broadband background.
+          A genuine brain component will never reach this level.
+        """
         sfreq = raw.info['sfreq']
         src = ica.get_sources(raw).get_data()
         n_comp = src.shape[0]
-        
-        reject = []
+
+        candidates: list[tuple[float, int]] = []   # (snr, component_index)
         nyq = sfreq / 2.0
         harmonics = np.arange(f_dbs, min(nyq, 105.0), f_dbs)
-        
+
         for ic in range(n_comp):
             fw, psd = sp_signal.welch(src[ic], fs=sfreq, nperseg=1024)
-            
+
             harm_mask = np.zeros(len(fw), dtype=bool)
             for h in harmonics:
                 harm_mask |= (fw >= h - 0.4) & (fw <= h + 0.4)
             nonharm_mask = (fw >= 1.0) & (fw <= 100.0) & ~harm_mask
-            
+
             if harm_mask.any() and nonharm_mask.any():
                 snr = psd[harm_mask].mean() / (np.median(psd[nonharm_mask]) + 1e-30)
-                if snr > 5.0:  # raised from 3.0 — only reject strongly DBS-locked ICs
-                    reject.append(ic)
+                if snr > 10.0:   # only truly DBS-dominant components
+                    candidates.append((snr, ic))
 
-        ica.exclude = reject[:2]  # cap at 2 to prevent over-exclusion of brain components
+        # Sort by descending SNR; reject only the single worst component
+        candidates.sort(reverse=True)
+        to_reject = [ic for _, ic in candidates[:1]]
+
+        if to_reject:
+            print(f"  ICA: rejecting component {to_reject[0]} "
+                  f"(SNR={candidates[0][0]:.1f} × background)")
+        else:
+            print("  ICA: no component exceeded SNR threshold — no rejection")
+
+        ica.exclude = to_reject
         ica.apply(raw, verbose=False)
         return raw
 

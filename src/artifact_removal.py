@@ -150,14 +150,32 @@ def allen_hampel_fft(
         tgt_hi = min(n_fft - 1, h_bin + tgt_bins + 1)
         tgt_slice = slice(tgt_lo, tgt_hi)
 
+        # ── Background estimation: use only the FLANKING bins of the
+        #    reference window, explicitly excluding the target (spike) zone.
+        #    This is the "leave-spike-out" MAD estimator.  Without this,
+        #    a broad/bright DBS spike inflates both the median and MAD,
+        #    raising the detection threshold and allowing spike residuals
+        #    to survive as "non-outliers".
+        flank_idx = np.concatenate([
+            np.arange(ref_lo, max(ref_lo, tgt_lo)),       # left flank
+            np.arange(min(n_fft, tgt_hi), ref_hi),         # right flank
+        ])
+        # Need at least 5 flank bins for a reliable MAD; fall back to full
+        # window only if the harmonic is so close to DC/Nyquist that flanks
+        # are degenerate.
+        use_full_window = flank_idx.size < 5
+
         replaced_this = 0
         for part_attr in ("real", "imag"):
-            part_window = getattr(S[:, ref_lo:ref_hi], part_attr)  # (n_ch, win)
+            if use_full_window:
+                bg_window = getattr(S[:, ref_lo:ref_hi], part_attr)
+            else:
+                bg_window = getattr(S[:, flank_idx], part_attr)   # (n_ch, n_flank)
 
-            # Median and MAD of the reference window per channel
-            med_win = np.median(part_window, axis=1, keepdims=True)  # (n_ch, 1)
+            # Median and MAD of the background (off-spike) bins per channel
+            med_win = np.median(bg_window, axis=1, keepdims=True)  # (n_ch, 1)
             mad_win = np.median(
-                np.abs(part_window - med_win), axis=1, keepdims=True
+                np.abs(bg_window - med_win), axis=1, keepdims=True
             )
             thr = n_sigmas * MAD_SCALE * np.maximum(mad_win, 1e-30)
 
@@ -166,7 +184,7 @@ def allen_hampel_fft(
             outlier = abs_dev > thr                                   # (n_ch, tgt)
 
             if outlier.any():
-                # Replace each channel's outlier bins with the window median
+                # Replace each channel's outlier bins with the background median
                 if part_attr == "real":
                     S.real[:, tgt_slice][outlier] = np.broadcast_to(
                         med_win, part_tgt.shape

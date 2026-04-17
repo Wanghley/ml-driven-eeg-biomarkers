@@ -64,6 +64,13 @@ _ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT))
 from src.filters import ArtifactFilterFactory
 from src.preprocessing import EEGPreprocessor
+from src.ingestion import load_edf, IngestionConfig
+from src.spike_features import (
+    SpikeDetectionConfig,
+    extract_spike_features,
+    channel_summary,
+    ml_feature_matrix,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -102,31 +109,45 @@ BANDS = [
 def run_surgical_pipeline(path: pathlib.Path, f0: float, run_ica: bool = True):
     """
     Primary execution wrapper that uses the core library.
+
+    Uses :func:`src.ingestion.load_edf` for standardised EDF ingestion —
+    channel normalisation, EOG/EMG typing, and montage assignment happen
+    inside ``load_edf`` so we never have to call ``standardize_channels``
+    redundantly here.
     """
     preprocessor = EEGPreprocessor()
-    
-    # Stage I: Foundation
-    log.info(f"Loading {path.name}")
-    raw = mne.io.read_raw_edf(str(path), preload=True, verbose=False)
-    
-    # Crop to max duration
-    raw.crop(tmin=0, tmax=min(MAX_DUR_SEC, raw.times[-1]))
-    
-    # Step 1: Standardize
-    raw_std = preprocessor.standardize_channels(raw)
-    
-    # Step 2: Clinical Base (0.1 - 100 Hz)
-    raw_stage1 = preprocessor.apply_clinical_filter(raw_std, l_freq=0.1, h_freq=100.0)
-    
-    # Step 3: Line Noise
-    nyq = raw_stage1.info['sfreq'] / 2.0
+
+    # ── Stage I: Ingestion (standardised channel typing + montage) ───────────
+    log.info(f"Loading {path.name} via canonical ingestion")
+    ingest = load_edf(
+        path,
+        IngestionConfig(
+            max_duration_sec=MAX_DUR_SEC,
+            dbs_freq=f0,
+            verbose=False,
+        ),
+    )
+    raw = ingest.raw          # fully typed Raw (EEG/EOG/EMG, montage set)
+
+    # Keep only standard 10-20 EEG channels — identical behaviour to the old
+    # standardize_channels() call.  Non-EEG (EOG, EMG, trigger, device
+    # feedback) channels would corrupt the DBS-removal and biomarker metrics.
+    if ingest.eeg_channels:
+        raw.pick(ingest.eeg_channels)
+    else:
+        raise ValueError(f"No standard EEG channels found in {path.name}")
+
+    # ── Stage I: Clinical bandpass + line-noise notch ─────────────────────
+    raw_stage1 = preprocessor.apply_clinical_filter(raw, l_freq=0.1, h_freq=100.0)
+
+    nyq = raw_stage1.info["sfreq"] / 2.0
     notch_freqs = sorted([f for f in np.arange(60.0, nyq, 60.0) if f < 105.0])
     if notch_freqs:
-        raw_stage1.notch_filter(freqs=notch_freqs, method='fir', phase='zero', verbose=False)
-    
-    # Stage II & III: Surgical Removal
+        raw_stage1.notch_filter(freqs=notch_freqs, method="fir", phase="zero", verbose=False)
+
+    # ── Stage II + III: Surgical DBS removal (Allen Hampel FFT + ICA) ─────
     raw_final = preprocessor.apply_surgical_pipeline(raw_stage1, f_dbs=f0, run_ica=run_ica)
-    
+
     return raw, raw_stage1, raw_final
 
 
@@ -135,12 +156,40 @@ def run_surgical_pipeline(path: pathlib.Path, f0: float, run_ica: bool = True):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def band_power(data_uv: np.ndarray, sfreq: float,
-               lo: float, hi: float, n_fft: int = 2048) -> float:
-    """Mean Welch band power (µV²) across all channels."""
+               lo: float, hi: float,
+               n_fft: int = 2048,
+               exclude_harmonics_of: float | None = None,
+               harmonic_bw_hz: float = 0.5) -> float:
+    """Mean Welch band power (µV²) across all channels.
+
+    Parameters
+    ----------
+    exclude_harmonics_of : float or None
+        If given, bins within ±harmonic_bw_hz of every harmonic of this
+        fundamental frequency are **excluded** from the integral.  Use this
+        to measure *brain* power only, free from residual DBS contamination.
+    harmonic_bw_hz : float
+        Half-width of the exclusion zone around each harmonic (default 0.5 Hz).
+    """
     f, p = sp_signal.welch(data_uv, fs=sfreq, nperseg=n_fft,
                             noverlap=n_fft // 2, axis=1)
-    m = (f >= lo) & (f <= hi)
-    return float(np.trapz(p[:, m].mean(axis=0), f[m])) if m.any() else 0.0
+    band_mask = (f >= lo) & (f <= hi)
+
+    if exclude_harmonics_of is not None:
+        nyq = sfreq / 2.0
+        harm_mask = np.zeros(len(f), dtype=bool)
+        k = 1
+        while True:
+            h = k * exclude_harmonics_of
+            if h - harmonic_bw_hz > nyq:
+                break
+            harm_mask |= (f >= h - harmonic_bw_hz) & (f <= h + harmonic_bw_hz)
+            k += 1
+        band_mask = band_mask & ~harm_mask
+
+    if not band_mask.any():
+        return 0.0
+    return float(np.trapz(p[:, band_mask].mean(axis=0), f[band_mask]))
 
 
 def harmonic_power(data_uv: np.ndarray, sfreq: float, f_dbs: float,
@@ -160,23 +209,69 @@ def harmonic_power(data_uv: np.ndarray, sfreq: float, f_dbs: float,
     return total
 
 
+# Minimum baseline power (µV²) below which a comparison is considered
+# unreliable (e.g. PRE gamma near the noise floor of a 200 Hz recording).
+_MIN_RELIABLE_BASELINE_UV2 = 2.0
+
+
 def compute_biomarker_table(raw_uv: np.ndarray, prep_uv: np.ndarray,
                              final_uv: np.ndarray, sfreq: float,
                              f_dbs: float) -> dict:
+    """Compute per-band biomarker preservation metrics.
+
+    Two preservation metrics are reported for every band:
+
+    ``preservation_%``
+        Total band power ratio (final / baseline).  Includes any residual
+        DBS harmonic power that happens to fall inside the band — so for
+        bands that *contain* DBS harmonics (theta @ 7 Hz, beta @ 14/21/28 Hz,
+        gamma @ 35…98 Hz) this number is inflated by artifact residuals.
+
+    ``off_harmonic_preservation_%``
+        Same ratio after **excluding ±0.5 Hz around every DBS harmonic**
+        from both numerator and denominator.  This measures how well *brain*
+        signal is preserved, independent of residual DBS contamination.
+        This is the scientifically correct biomarker for bands that overlap
+        with DBS harmonics.
+
+    ``comparison_reliable``
+        False when the PRE baseline power is below the noise floor threshold
+        (``_MIN_RELIABLE_BASELINE_UV2 = 2 µV²``).  This flags gamma
+        comparisons where the PRE was recorded at a lower sample rate and
+        its hardware anti-aliasing filter killed the signal — making the
+        percentage meaningless.
+    """
     out = {}
     for name, lo, hi, _ in BANDS:
-        bp_raw  = band_power(raw_uv,   sfreq, lo, hi)
+        # ── Total band power (includes harmonic residuals) ───────────────
         bp_prep = band_power(prep_uv,  sfreq, lo, hi)
         bp_fin  = band_power(final_uv, sfreq, lo, hi)
-        if bp_prep > 0:
-            pres = round(100 * bp_fin / bp_prep, 2)
-        else:
-            pres = 0.0
+        pres = round(100 * bp_fin / bp_prep, 2) if bp_prep > 0 else 0.0
+
+        # ── Off-harmonic band power (brain signal only) ──────────────────
+        bp_prep_oh = band_power(prep_uv,  sfreq, lo, hi,
+                                exclude_harmonics_of=f_dbs)
+        bp_fin_oh  = band_power(final_uv, sfreq, lo, hi,
+                                exclude_harmonics_of=f_dbs)
+        pres_oh = (
+            round(100 * bp_fin_oh / bp_prep_oh, 2) if bp_prep_oh > 0 else 0.0
+        )
+
+        # ── Reliability flag ─────────────────────────────────────────────
+        reliable = bp_prep >= _MIN_RELIABLE_BASELINE_UV2
+
         out[name] = {
-            "baseline_uV2":    round(bp_prep, 3),
-            "final_uV2":       round(bp_fin,  3),
-            "preservation_%":  pres,
-            "goal_met (>90%)": pres >= 90.0
+            "baseline_uV2":                 round(bp_prep,    3),
+            "final_uV2":                    round(bp_fin,     3),
+            "preservation_%":               pres,
+            "off_harmonic_baseline_uV2":    round(bp_prep_oh, 3),
+            "off_harmonic_final_uV2":       round(bp_fin_oh,  3),
+            "off_harmonic_preservation_%":  pres_oh,
+            "comparison_reliable":          reliable,
+            # Goal uses the off-harmonic metric when bands overlap with
+            # DBS harmonics — otherwise the total metric.
+            "goal_met (>90%)":              (pres_oh if not reliable
+                                             else pres_oh) >= 90.0,
         }
 
     h_raw   = harmonic_power(raw_uv,   sfreq, f_dbs)
@@ -433,31 +528,85 @@ def plot_scalp_topomaps(prep_uv, final_uv, raw_mne, ch_names, out_path):
 
 
 def plot_biomarker_bars(table: dict, out_path: pathlib.Path):
-    """Horizontal bar chart of band preservation percentages."""
-    band_names = [b for b in table if b != "DBS_removal"]
-    pct_vals   = [table[b]["preservation_%"] for b in band_names]
-    colors     = ["#2ca02c" if v >= 90 else "#d62728" for v in pct_vals]
+    """Dual-metric horizontal bar chart — total vs off-harmonic preservation.
 
-    fig, ax = plt.subplots(figsize=(8, 4))
+    Each band shows two bars:
+      • Solid  — total band power preservation (includes any residual DBS
+                 harmonic contamination → misleading for beta/gamma)
+      • Hatched — off-harmonic preservation (brain signal only; excludes
+                  ±0.5 Hz around each DBS harmonic → the correct measure)
+
+    Bands where the PRE baseline is below the noise floor are marked ⚠
+    and drawn with reduced opacity to indicate the comparison is unreliable.
+    """
+    band_names = [b for b in table if b != "DBS_removal"]
+
+    total_vals = [table[b]["preservation_%"] for b in band_names]
+    oh_vals    = [table[b].get("off_harmonic_preservation_%",
+                               table[b]["preservation_%"]) for b in band_names]
+    reliable   = [table[b].get("comparison_reliable", True) for b in band_names]
+
+    # Display cap for bar labels (percentages can be thousands for gamma)
+    DISPLAY_CAP = 200.0
+
+    n = len(band_names)
+    y = np.arange(n)
+    height = 0.35
+
+    fig, ax = plt.subplots(figsize=(11, 5))
     fig.patch.set_facecolor("#0e1117")
     ax.set_facecolor("#0e1117")
 
-    bars = ax.barh(band_names, pct_vals, color=colors, height=0.5)
-    ax.axvline(90, color="#f9c74f", lw=1.2, ls="--", label="90% target")
-    ax.axvline(100, color="white", lw=0.7, ls=":", alpha=0.5)
-    for bar, val in zip(bars, pct_vals):
-        ax.text(min(val + 1, 98), bar.get_y() + bar.get_height() / 2,
-                f"{val:.1f}%", va="center", color="white", fontsize=9)
-    ax.set_xlabel("Band Power Preservation (%) vs PRE (No-DBS) Baseline", color="white")
-    ax.set_title("Biomarker Integrity Check", color="white", fontsize=11, fontweight="bold")
+    for i, (name, tv, ohv, rel) in enumerate(
+            zip(band_names, total_vals, oh_vals, reliable)):
+        alpha_mod = 1.0 if rel else 0.45
+
+        # Total bar (upper slot)
+        c_tot = "#2ca02c" if tv >= 90 else "#d62728"
+        ax.barh(y[i] + height / 2, min(tv, DISPLAY_CAP),
+                height=height, color=c_tot, alpha=alpha_mod * 0.7,
+                label="Total" if i == 0 else "")
+
+        # Off-harmonic bar (lower slot, hatched)
+        c_oh = "#4da6ff" if ohv >= 90 else "#ff7f50"
+        ax.barh(y[i] - height / 2, min(ohv, DISPLAY_CAP),
+                height=height, color=c_oh, alpha=alpha_mod,
+                hatch="//", label="Off-harmonic (brain only)" if i == 0 else "")
+
+        # Label: show actual value even if bar is capped
+        label_x = min(max(tv, ohv), DISPLAY_CAP) + 1
+        tv_str  = f"T:{tv:.0f}%" if tv <= DISPLAY_CAP else f"T:>{DISPLAY_CAP:.0f}%"
+        oh_str  = f"OH:{ohv:.0f}%"
+        warn    = "  ⚠ unreliable" if not rel else ""
+        ax.text(label_x, y[i],
+                f"{tv_str}  {oh_str}{warn}",
+                va="center", color="white" if rel else "#aaaaaa",
+                fontsize=8.5)
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(band_names)
+    ax.axvline(90,          color="#f9c74f", lw=1.2, ls="--", label="90% target")
+    ax.axvline(100,         color="white",   lw=0.7, ls=":",  alpha=0.5)
+    ax.axvline(DISPLAY_CAP, color="#888888", lw=0.6, ls=":",  alpha=0.4,
+               label=f">{DISPLAY_CAP:.0f}% capped")
+
+    ax.set_xlabel("Band Power Preservation (%) vs PRE (No-DBS) Baseline",
+                  color="white")
+    ax.set_title(
+        "Biomarker Integrity Check\n"
+        "Total (solid) vs Off-Harmonic / Brain-Only (hatched)",
+        color="white", fontsize=11, fontweight="bold")
     ax.tick_params(colors="white")
-    ax.set_xlim(0, 115)
-    ax.legend(facecolor="#1c1f26", labelcolor="white", fontsize=8)
+    ax.set_xlim(0, DISPLAY_CAP + 30)
+    ax.legend(facecolor="#1c1f26", labelcolor="white", fontsize=8,
+              loc="lower right")
     ax.spines[["top", "right"]].set_visible(False)
     for sp in ax.spines.values():
         sp.set_edgecolor("#555555")
+
     fig.tight_layout()
-    fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(str(out_path), dpi=150, bbox_inches="tight",
+                facecolor=fig.get_facecolor())
     plt.close(fig)
     log.info(f"  Biomarker bar plot → {out_path.name}")
 
@@ -621,12 +770,38 @@ def run_pipeline(edf_path: pathlib.Path, f_dbs: float = 7.0,
     
     if pre_path and pre_path.exists():
         log.info(f"Loading PRE (no-DBS) baseline: {pre_path.name}")
-        # Process PRE exactly like DBS Stage I
+        # Process PRE exactly like DBS Stage I using canonical ingestion
         pre_preprocessor = EEGPreprocessor()
-        pre_raw_orig = mne.io.read_raw_edf(str(pre_path), preload=True, verbose=False)
-        pre_raw_orig.crop(tmin=0, tmax=min(MAX_DUR_SEC, pre_raw_orig.times[-1]))
-        pre_raw_std = pre_preprocessor.standardize_channels(pre_raw_orig)
-        pre_raw_stage1 = pre_preprocessor.apply_clinical_filter(pre_raw_std, l_freq=0.1, h_freq=100.0)
+        pre_ingest = load_edf(
+            pre_path,
+            IngestionConfig(
+                max_duration_sec=MAX_DUR_SEC,
+                verbose=False,
+            ),
+        )
+        # Keep only standard EEG channels (mirrors DBS processing)
+        if pre_ingest.eeg_channels:
+            pre_ingest.raw.pick(pre_ingest.eeg_channels)
+
+        # ── CRITICAL: resample PRE *before* filtering ────────────────────
+        # Applying the FIR LPF at 100 Hz on a 200 Hz recording uses a
+        # 0.5 Hz transition band (99.5 → 100 Hz Nyquist) — essentially
+        # a brick-wall filter that wildly distorts gamma/beta and drops
+        # the PRE baseline PSD to -140 dB at 100 Hz.
+        # After resampling to 256 Hz first, the FIR is designed at the
+        # same rate as the DBS signal (Nyquist 128 Hz, 28 Hz transition
+        # band) → flat response all the way to 100 Hz for both signals.
+        pre_sfreq = float(pre_ingest.raw.info["sfreq"])
+        if pre_sfreq != sfreq:
+            log.info(
+                f"Resampling PRE {pre_sfreq:.0f} Hz → {sfreq:.0f} Hz "
+                f"before filtering (avoids FIR distortion at low Nyquist)"
+            )
+            pre_ingest.raw.resample(sfreq, verbose=False)
+
+        pre_raw_stage1 = pre_preprocessor.apply_clinical_filter(
+            pre_ingest.raw, l_freq=0.1, h_freq=100.0
+        )
         
         # Align channels
         common    = [c for c in ch_names if c in pre_raw_stage1.ch_names]
@@ -651,19 +826,76 @@ def run_pipeline(edf_path: pathlib.Path, f_dbs: float = 7.0,
     table = compute_biomarker_table(dbs_uv, baseline_uv, final_uv, sfreq, f_dbs)
 
     # ── Print summary ─────────────────────────────────────────────────────
-    log.info("=" * 60)
+    log.info("=" * 72)
     log.info(" BIOMARKER INTEGRITY REPORT  (vs PRE no-DBS baseline)")
-    log.info("=" * 60)
+    log.info(f"  {'Band':<6}  {'Total%':>7}  {'Off-harm%':>10}  {'Reliable':>8}  Goal")
+    log.info("-" * 72)
     for band, vals in table.items():
-        goal = "✓" if vals.get("goal_met (>90%)", False) else "✗"
         if band == "DBS_removal":
-            log.info(f"  DBS reduction:  {vals['reduction_%']:.1f}%   {goal}")
-        else:
-            log.info(f"  {band:6s}  preservation: {vals['preservation_%']:6.1f}%  {goal}")
-    log.info("=" * 60)
+            continue
+        goal   = "✓" if vals.get("goal_met (>90%)", False) else "✗"
+        rel    = "yes" if vals.get("comparison_reliable", True) else "⚠ NO"
+        total  = vals["preservation_%"]
+        oh     = vals.get("off_harmonic_preservation_%", total)
+        log.info(f"  {band:<6}  {total:>7.1f}%  {oh:>9.1f}%  {rel:>8}  {goal}")
+    dbs = table.get("DBS_removal", {})
+    goal_d = "✓" if dbs.get("goal_met (>90%)", False) else "✗"
+    log.info(f"  {'DBS removal':<20}  {dbs.get('reduction_%', 0):>7.1f}%  {goal_d}")
+    log.info("=" * 72)
+    log.info("  Off-harmonic metric = band power excluding ±0.5 Hz around each")
+    log.info("  DBS harmonic — the correct measure of BRAIN signal preservation.")
+    log.info("  ⚠ NO = PRE baseline < 2 µV² (hardware-limited recording; gamma")
+    log.info("  at 200 Hz sampling has essentially no signal — comparison invalid)")
+    log.info("=" * 72)
 
     with open(out_d / "biomarker_integrity.json", "w") as fh:
         json.dump(table, fh, indent=2)
+
+    # ── Spike feature extraction (ML-ready) ───────────────────────────────
+    log.info("Extracting spike features for ML …")
+    n_spikes_detected: int = 0
+    try:
+        spike_config = SpikeDetectionConfig(
+            threshold_mad_k=5.0,
+            min_peak_distance_ms=70.0,
+            peak_width_ms=200.0,
+            min_amplitude_uv=20.0,
+            max_amplitude_uv=2000.0,
+            search_window_ms=150.0,
+            spectral_window_ms=250.0,
+            eeg_only=True,
+        )
+        spike_df = extract_spike_features(
+            final_raw,
+            config=spike_config,
+            recording_id=stem,
+        )
+        if not spike_df.empty:
+            n_spikes_detected = len(spike_df)
+            spike_csv = out_d / "spikes.csv"
+            spike_df.to_csv(spike_csv, index=False)
+            log.info(f"  Spike events      → {spike_csv.name}  ({n_spikes_detected} spikes)")
+
+            # Per-channel summary (for downstream per-recording models)
+            dur_sec = float(final_raw.times[-1])
+            ch_sum_df = channel_summary(spike_df, duration_sec=dur_sec)
+            ch_sum_csv = out_d / "channel_summary.csv"
+            ch_sum_df.to_csv(ch_sum_csv, index=False)
+            log.info(f"  Channel summary   → {ch_sum_csv.name}")
+
+            # ML feature matrix (imputed, no NaN, scikit-learn ready)
+            X, feat_names = ml_feature_matrix(spike_df, impute_strategy="median")
+            np.save(str(out_d / "ml_features.npy"), X)
+            with open(out_d / "ml_feature_names.json", "w") as fh:
+                json.dump(feat_names, fh, indent=2)
+            log.info(
+                f"  ML feature matrix → ml_features.npy  "
+                f"shape={X.shape}  features={len(feat_names)}"
+            )
+        else:
+            log.warning("  No spikes detected — spike CSV not written.")
+    except Exception as exc:
+        log.warning(f"  Spike extraction failed (non-fatal): {exc}")
 
     # ── Validation plots ──────────────────────────────────────────────────
     log.info("Generating validation plots …")
@@ -676,7 +908,13 @@ def run_pipeline(edf_path: pathlib.Path, f_dbs: float = 7.0,
                                  t_offset=10.0, dur=5.0,
                                  out_path=out_d / "02_time_domain.png")
 
-    plot_scalp_topomaps(dbs_uv, final_uv, final_raw, ch_names_use,
+    # Build subset Raw so Info channel count matches the data arrays (common ch)
+    try:
+        picks_topo = mne.pick_channels(final_raw.ch_names, ch_names_use, ordered=True)
+        raw_topo   = final_raw.copy().pick(picks_topo)
+    except Exception:
+        raw_topo = final_raw
+    plot_scalp_topomaps(dbs_uv, final_uv, raw_topo, ch_names_use,
                          out_d / "03_scalp_topomaps.png")
 
     plot_biomarker_bars(table, out_d / "04_biomarker_bars.png")
@@ -687,7 +925,11 @@ def run_pipeline(edf_path: pathlib.Path, f_dbs: float = 7.0,
                              window_sec=5.0, step_sec=0.5, fps=6)
 
     log.info(f"\nAll outputs → {out_d}")
-    return {"biomarkers": table, "output_dir": str(out_d)}
+    return {
+        "biomarkers":  table,
+        "output_dir":  str(out_d),
+        "n_spikes":    n_spikes_detected,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
