@@ -1,0 +1,58 @@
+{
+  "Delta": {
+    "baseline_uV2": 351.906,
+    "final_uV2": 245.811,
+    "preservation_%": 69.85,
+    "off_harmonic_baseline_uV2": 351.906,
+    "off_harmonic_final_uV2": 245.811,
+    "off_harmonic_preservation_%": 69.85,
+    "comparison_reliable": true,
+    "goal_met (>90%)": false
+  },
+  "Theta": {
+    "baseline_uV2": 82.449,
+    "final_uV2": 143.163,
+    "preservation_%": 173.64,
+    "off_harmonic_baseline_uV2": 82.449,
+    "off_harmonic_final_uV2": 143.163,
+    "off_harmonic_preservation_%": 173.64,
+    "comparison_reliable": true,
+    "goal_met (>90%)": true
+  },
+  "Alpha": {
+    "baseline_uV2": 80.753,
+    "final_uV2": 56.286,
+    "preservation_%": 69.7,
+    "off_harmonic_baseline_uV2": 80.753,
+    "off_harmonic_final_uV2": 56.286,
+    "off_harmonic_preservation_%": 69.7,
+    "comparison_reliable": true,
+    "goal_met (>90%)": false
+  },
+  "Beta": {
+    "baseline_uV2": 20.885,
+    "final_uV2": 53.033,
+    "preservation_%": 253.93,
+    "off_harmonic_baseline_uV2": 20.885,
+    "off_harmonic_final_uV2": 53.033,
+    "off_harmonic_preservation_%": 253.93,
+    "comparison_reliable": true,
+    "goal_met (>90%)": true
+  },
+  "Gamma": {
+    "baseline_uV2": 1.021,
+    "final_uV2": 27.724,
+    "preservation_%": 2715.18,
+    "off_harmonic_baseline_uV2": 1.001,
+    "off_harmonic_final_uV2": 28.253,
+    "off_harmonic_preservation_%": 2821.33,
+    "comparison_reliable": false,
+    "goal_met (>90%)": true
+  },
+  "DBS_removal": {
+    "harmonic_power_raw_uV2": 4.588,
+    "harmonic_power_final_uV2": 0.113,
+    "reduction_%": 97.54,
+    "goal_met (>90%)": true
+  }
+}
