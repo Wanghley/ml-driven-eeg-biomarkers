@@ -340,9 +340,10 @@ def _psd_mean(data_uv: np.ndarray, sfreq: float,
     return f[m], db
 
 
-def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path):
+def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path,
+                    theme: dict | None = None):
     """
-    2-panel dual-zoom PSD figure (dark theme, publication quality).
+    2-panel dual-zoom PSD figure (theme-aware, publication quality).
 
     Left  : 0.5 – 50 Hz overview — shows DBS harmonics, LPF rolloff, band structure.
     Right : 1 – 30 Hz clinical zoom — shows theta/alpha/beta preservation detail.
@@ -353,9 +354,11 @@ def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path)
     • Hann-smoothed curves reduce frequency-bin hash.
     • LPF rolloff at 45 Hz clearly visible in left panel.
     """
+    th = theme if theme is not None else _DARK
+
     fig, axes = plt.subplots(1, 2, figsize=(17, 6),
                               gridspec_kw={"wspace": 0.30})
-    fig.patch.set_facecolor("#0e1117")
+    fig.patch.set_facecolor(th["bg"])
 
     layers = [
         (stage1_uv, "Stage I — DBS (preprocessed)", "#e07b39", 1.2, "--"),
@@ -383,7 +386,7 @@ def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path)
     global_max = np.percentile(np.concatenate(all_db_vals), 98)
 
     for ax, fmin_p, fmax_p, panel_title in panels:
-        ax.set_facecolor("#0e1117")
+        ax.set_facecolor(th["bg"])
 
         # ── Draw each curve, clipped to this panel's freq range ──────────
         panel_db_vals = []
@@ -418,12 +421,12 @@ def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path)
                 continue
             if h > fmax_p:
                 break
-            ax.axvline(h, color="#f9c74f", lw=0.8, ls=":",
+            ax.axvline(h, color=th["dbs_marker"], lw=0.8, ls=":",
                        alpha=0.55, zorder=2,
                        label="DBS harmonic" if k == 1 else "")
             ax.text(h, global_max + 0.5, f"{k}×",
                     ha="center", va="bottom", fontsize=5.5,
-                    color="#f9c74f", alpha=0.7)
+                    color=th["dbs_marker"], alpha=0.7)
 
         # ── LPF rolloff marker (left panel only) ────────────────────────
         if fmax_p >= LPF_HZ and ax is axes[0]:
@@ -438,23 +441,23 @@ def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path)
         ax.set_ylim(global_min - pad, global_max + pad + 4)
         ax.set_xlim(fmin_p, fmax_p)
 
-        ax.set_xlabel("Frequency (Hz)", color="white", fontsize=10)
-        ax.set_ylabel("PSD  (dB µV²/Hz)", color="white", fontsize=10)
-        ax.set_title(panel_title, color="white", fontsize=11, fontweight="bold")
-        ax.tick_params(colors="white", labelsize=8)
-        ax.grid(True, color="#2a2a3a", lw=0.5, ls="--", alpha=0.6)
+        ax.set_xlabel("Frequency (Hz)", color=th["text"], fontsize=10)
+        ax.set_ylabel("PSD  (dB µV²/Hz)", color=th["text"], fontsize=10)
+        ax.set_title(panel_title, color=th["text"], fontsize=11, fontweight="bold")
+        ax.tick_params(colors=th["tick"] if "tick" in th else th["text"], labelsize=8)
+        ax.grid(True, color=th["grid"], lw=0.5, ls="--", alpha=0.6)
         ax.spines[["top", "right"]].set_visible(False)
         for sp in ax.spines.values():
-            sp.set_edgecolor("#444455")
+            sp.set_edgecolor(th["spine"])
 
         if ax is axes[0]:
-            ax.legend(fontsize=8, facecolor="#1c1f26",
-                      labelcolor="white", loc="lower left",
-                      framealpha=0.85, edgecolor="#555566")
+            ax.legend(fontsize=8, facecolor=th["legend_bg"],
+                      labelcolor=th["text"], loc="lower left",
+                      framealpha=0.85, edgecolor=th["spine2"])
 
     fig.suptitle(
         "Triple-Overlay PSD  —  DBS Raw  ●  PRE Baseline (no DBS)  ●  Final Cleaned",
-        color="white", fontsize=13, fontweight="bold", y=1.01
+        color=th["text"], fontsize=13, fontweight="bold", y=1.01
     )
     fig.tight_layout()
     fig.savefig(str(out_path), dpi=160, bbox_inches="tight",
@@ -464,49 +467,53 @@ def plot_triple_psd(raw_uv, pre_uv, stage1_uv, final_uv, sfreq, f_dbs, out_path)
 
 
 def plot_time_domain_comparison(raw_uv, prep_uv, final_uv,
-                                 sfreq, ch_names, f_dbs, t_offset, dur, out_path):
+                                 sfreq, ch_names, f_dbs, t_offset, dur, out_path,
+                                 theme: dict | None = None):
     """3-panel time-domain comparison (channel Cz or first available)."""
+    th = theme if theme is not None else _DARK
     try:
         ci = ch_names.index(ANALYSIS_CH)
     except ValueError:
         ci = 0
 
-    i0 = int(t_offset * sfreq)
-    i1 = i0 + int(dur * sfreq)
-    t  = np.linspace(t_offset, t_offset + dur, i1 - i0)
+    i0   = int(t_offset * sfreq)
+    i1   = i0 + int(dur * sfreq)
+    tvec = np.linspace(t_offset, t_offset + dur, i1 - i0)
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
-    fig.patch.set_facecolor("#0e1117")
+    fig.patch.set_facecolor(th["bg"])
     triples = [
         (raw_uv,   "Raw (as-is)",              "#888888"),
         (prep_uv,  "Stage I Standard Prep",    "#ff7f0e"),
         (final_uv, "Final (DBS + ICA clean)", "#1f77b4"),
     ]
     for ax, (data, lbl, col) in zip(axes, triples):
-        ax.set_facecolor("#0e1117")
-        ax.plot(t, data[ci, i0:i1], color=col, lw=0.9)
-        ax.set_ylabel(lbl, color="white", fontsize=8)
-        ax.tick_params(colors="white")
+        ax.set_facecolor(th["bg"])
+        ax.plot(tvec, data[ci, i0:i1], color=col, lw=0.9)
+        ax.set_ylabel(lbl, color=th["text"], fontsize=8)
+        ax.tick_params(colors=th["text"])
         ax.spines[["top", "right"]].set_visible(False)
         for spine in ax.spines.values():
-            spine.set_edgecolor("#555555")
+            spine.set_edgecolor(th["spine2"])
         # DBS pulse markers
         for k in range(int(t_offset * f_dbs) - 1, int((t_offset + dur) * f_dbs) + 2):
             pt = k / f_dbs
             if t_offset <= pt <= t_offset + dur:
-                ax.axvline(pt, color="#f9c74f", lw=0.5, alpha=0.4)
+                ax.axvline(pt, color=th["dbs_marker"], lw=0.5, alpha=0.4)
 
-    axes[-1].set_xlabel("Time (s)", color="white")
+    axes[-1].set_xlabel("Time (s)", color=th["text"])
     fig.suptitle(f"Time-Domain Comparison — Channel {ch_names[ci]}  ({dur:.0f}s segment)",
-                 color="white", fontsize=11, fontweight="bold")
+                 color=th["text"], fontsize=11, fontweight="bold")
     fig.tight_layout()
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     log.info(f"  Time-domain plot → {out_path.name}")
 
 
-def plot_scalp_topomaps(prep_uv, final_uv, raw_mne, ch_names, out_path):
+def plot_scalp_topomaps(prep_uv, final_uv, raw_mne, ch_names, out_path,
+                        theme: dict | None = None):
     """Scalp topomaps of mean absolute amplitude before and after cleaning."""
+    th = theme if theme is not None else _DARK
     try:
         info = raw_mne.info.copy()
         amp_before = np.abs(prep_uv).mean(axis=1)   # (n_ch,)
@@ -522,14 +529,14 @@ def plot_scalp_topomaps(prep_uv, final_uv, raw_mne, ch_names, out_path):
         diff = amp_before - amp_after
 
         fig, axes = plt.subplots(1, 3, figsize=(13, 4))
-        fig.patch.set_facecolor("#0e1117")
+        fig.patch.set_facecolor(th["bg"])
 
         for ax, topo_data, title in [
             (axes[0], amp_before, "Before DBS Removal\n(Stage I output)"),
             (axes[1], amp_after,  "After DBS + ICA\n(Final)"),
             (axes[2], diff,       "Difference\n(Artifact Removed)"),
         ]:
-            ax.set_facecolor("#0e1117")
+            ax.set_facecolor(th["bg"])
             vmin_p = min(0, diff.min()) if ax is axes[2] else vmin
             vmax_p = max(diff.max(), 1e-3) if ax is axes[2] else vmax
             mne.viz.plot_topomap(
@@ -538,10 +545,10 @@ def plot_scalp_topomaps(prep_uv, final_uv, raw_mne, ch_names, out_path):
                 vlim=(vmin_p, vmax_p),
                 sphere="auto",
             )
-            ax.set_title(title, color="white", fontsize=9)
+            ax.set_title(title, color=th["text"], fontsize=9)
 
         fig.suptitle("Scalp Topomaps — Mean Absolute Amplitude (µV)",
-                     color="white", fontsize=11, fontweight="bold")
+                     color=th["text"], fontsize=11, fontweight="bold")
         fig.tight_layout()
         fig.savefig(str(out_path), dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
         plt.close(fig)
@@ -550,7 +557,8 @@ def plot_scalp_topomaps(prep_uv, final_uv, raw_mne, ch_names, out_path):
         log.warning(f"Topomap rendering failed: {e}")
 
 
-def plot_biomarker_bars(table: dict, out_path: pathlib.Path):
+def plot_biomarker_bars(table: dict, out_path: pathlib.Path,
+                        theme: dict | None = None):
     """Dual-metric horizontal bar chart — total vs off-harmonic preservation.
 
     Each band shows two bars:
@@ -562,6 +570,7 @@ def plot_biomarker_bars(table: dict, out_path: pathlib.Path):
     Bands where the PRE baseline is below the noise floor are marked ⚠
     and drawn with reduced opacity to indicate the comparison is unreliable.
     """
+    th = theme if theme is not None else _DARK
     band_names = [b for b in table if b != "DBS_removal"]
 
     total_vals = [table[b]["preservation_%"] for b in band_names]
@@ -577,8 +586,8 @@ def plot_biomarker_bars(table: dict, out_path: pathlib.Path):
     height = 0.35
 
     fig, ax = plt.subplots(figsize=(11, 5))
-    fig.patch.set_facecolor("#0e1117")
-    ax.set_facecolor("#0e1117")
+    fig.patch.set_facecolor(th["bg"])
+    ax.set_facecolor(th["bg"])
 
     for i, (name, tv, ohv, rel) in enumerate(
             zip(band_names, total_vals, oh_vals, reliable)):
@@ -603,29 +612,29 @@ def plot_biomarker_bars(table: dict, out_path: pathlib.Path):
         warn    = "  ⚠ unreliable" if not rel else ""
         ax.text(label_x, y[i],
                 f"{tv_str}  {oh_str}{warn}",
-                va="center", color="white" if rel else "#aaaaaa",
+                va="center", color=th["text"] if rel else th["spine2"],
                 fontsize=8.5)
 
     ax.set_yticks(y)
-    ax.set_yticklabels(band_names)
-    ax.axvline(90,          color="#f9c74f", lw=1.2, ls="--", label="90% target")
-    ax.axvline(100,         color="white",   lw=0.7, ls=":",  alpha=0.5)
-    ax.axvline(DISPLAY_CAP, color="#888888", lw=0.6, ls=":",  alpha=0.4,
+    ax.set_yticklabels(band_names, color=th["text"])
+    ax.axvline(90,          color=th["dbs_marker"], lw=1.2, ls="--", label="90% target")
+    ax.axvline(100,         color=th["ref_zero"],   lw=0.7, ls=":",  alpha=0.5)
+    ax.axvline(DISPLAY_CAP, color=th["spine2"],     lw=0.6, ls=":",  alpha=0.4,
                label=f">{DISPLAY_CAP:.0f}% capped")
 
     ax.set_xlabel("Band Power Preservation (%) vs PRE (No-DBS) Baseline",
-                  color="white")
+                  color=th["text"])
     ax.set_title(
         "Biomarker Integrity Check\n"
         "Total (solid) vs Off-Harmonic / Brain-Only (hatched)",
-        color="white", fontsize=11, fontweight="bold")
-    ax.tick_params(colors="white")
+        color=th["text"], fontsize=11, fontweight="bold")
+    ax.tick_params(colors=th["text"])
     ax.set_xlim(0, DISPLAY_CAP + 30)
-    ax.legend(facecolor="#1c1f26", labelcolor="white", fontsize=8,
+    ax.legend(facecolor=th["legend_bg"], labelcolor=th["text"], fontsize=8,
               loc="lower right")
     ax.spines[["top", "right"]].set_visible(False)
     for sp in ax.spines.values():
-        sp.set_edgecolor("#555555")
+        sp.set_edgecolor(th["spine2"])
 
     fig.tight_layout()
     fig.savefig(str(out_path), dpi=150, bbox_inches="tight",
@@ -638,7 +647,8 @@ def save_realtime_dashboard(raw_uv, final_uv, sfreq, ch_names,
                              f_dbs, out_path: pathlib.Path,
                              window_sec: float = 5.0,
                              step_sec:   float = 0.5,
-                             fps:        int   = 6):
+                             fps:        int   = 6,
+                             theme: dict | None = None):
     """
     Build the real-time sliding-window dashboard (Raw vs Final) and save as GIF.
 
@@ -647,6 +657,7 @@ def save_realtime_dashboard(raw_uv, final_uv, sfreq, ch_names,
     Top    : sliding time-domain traces (Raw grey, Final blue)
     Bottom : live PSD updated every frame (Raw grey, Final blue)
     """
+    th = theme if theme is not None else _DARK
     try:
         ci = ch_names.index(ANALYSIS_CH)
     except ValueError:
@@ -661,23 +672,23 @@ def save_realtime_dashboard(raw_uv, final_uv, sfreq, ch_names,
     sig_raw = raw_uv[ci,   :n_s]
     sig_fin = final_uv[ci, :n_s]
 
-    fig = plt.figure(figsize=(13, 7), facecolor="#0e1117")
+    fig = plt.figure(figsize=(13, 7), facecolor=th["bg"])
     gs  = gridspec.GridSpec(2, 1, height_ratios=[2, 1], hspace=0.4)
 
     # ── Time panel ────────────────────────────────────────────────────────
     ax_t = fig.add_subplot(gs[0])
-    ax_t.set_facecolor("#0e1117")
-    ax_t.tick_params(colors="white")
-    ax_t.set_ylabel("Amplitude (µV)", color="white")
-    ax_t.set_xlabel("Time (s)", color="white")
+    ax_t.set_facecolor(th["bg"])
+    ax_t.tick_params(colors=th["text"])
+    ax_t.set_ylabel("Amplitude (µV)", color=th["text"])
+    ax_t.set_xlabel("Time (s)", color=th["text"])
     ax_t.spines[["top", "right"]].set_visible(False)
     for sp in ax_t.spines.values():
-        sp.set_edgecolor("#555555")
+        sp.set_edgecolor(th["spine2"])
 
     line_r, = ax_t.plot([], [], color="#888888", lw=0.8, label="Raw",  alpha=0.7)
     line_f, = ax_t.plot([], [], color="#4da6ff", lw=1.3, label="Final clean")
-    ttl = ax_t.set_title("", color="white", fontsize=10)
-    ax_t.legend(facecolor="#1c1f26", labelcolor="white", fontsize=8, loc="upper right")
+    ttl = ax_t.set_title("", color=th["text"], fontsize=10)
+    ax_t.legend(facecolor=th["legend_bg"], labelcolor=th["text"], fontsize=8, loc="upper right")
 
     # DBS harmonic text annotation
     harm_lines = []
@@ -685,19 +696,19 @@ def save_realtime_dashboard(raw_uv, final_uv, sfreq, ch_names,
         h = k * f_dbs
         if h > 50:
             break
-        vl = ax_t.axvline(h, color="#f9c74f", lw=0.0)   # invisible placeholder
+        vl = ax_t.axvline(h, color=th["dbs_marker"], lw=0.0)   # invisible placeholder
         harm_lines.append(vl)
 
     # ── PSD panel ─────────────────────────────────────────────────────────
     ax_p = fig.add_subplot(gs[1])
-    ax_p.set_facecolor("#0e1117")
-    ax_p.tick_params(colors="white")
-    ax_p.set_ylabel("PSD (dB µV²/Hz)", color="white")
-    ax_p.set_xlabel("Frequency (Hz)", color="white")
+    ax_p.set_facecolor(th["bg"])
+    ax_p.tick_params(colors=th["text"])
+    ax_p.set_ylabel("PSD (dB µV²/Hz)", color=th["text"])
+    ax_p.set_xlabel("Frequency (Hz)", color=th["text"])
     ax_p.set_xlim(0.5, 50)
     ax_p.spines[["top", "right"]].set_visible(False)
     for sp in ax_p.spines.values():
-        sp.set_edgecolor("#555555")
+        sp.set_edgecolor(th["spine2"])
 
     line_rp, = ax_p.plot([], [], color="#888888", lw=0.9, label="Raw")
     line_fp, = ax_p.plot([], [], color="#4da6ff", lw=1.2, label="Final")
@@ -705,10 +716,10 @@ def save_realtime_dashboard(raw_uv, final_uv, sfreq, ch_names,
         h = k * f_dbs
         if h > nyq:
             break
-        ax_p.axvline(h, color="#f9c74f", lw=0.5, ls=":", alpha=0.5)
+        ax_p.axvline(h, color=th["dbs_marker"], lw=0.5, ls=":", alpha=0.5)
     for _, lo, hi, col in BANDS:
         ax_p.axvspan(lo, hi, color=col, alpha=0.07)
-    ax_p.legend(facecolor="#1c1f26", labelcolor="white", fontsize=7, loc="upper right")
+    ax_p.legend(facecolor=th["legend_bg"], labelcolor=th["text"], fontsize=7, loc="upper right")
 
     # update frequencies up to LPF_HZ for the dashboard PSD
     dash_fmax = LPF_HZ + 5.0
@@ -920,16 +931,8 @@ def run_pipeline(edf_path: pathlib.Path, f_dbs: float = 7.0,
     except Exception as exc:
         log.warning(f"  Spike extraction failed (non-fatal): {exc}")
 
-    # ── Validation plots ──────────────────────────────────────────────────
+    # ── Validation plots (both themes) ───────────────────────────────────
     log.info("Generating validation plots …")
-
-    plot_triple_psd(dbs_uv, baseline_uv, dbs_uv, final_uv, sfreq, f_dbs,
-                    out_d / "01_triple_psd.png")
-
-    plot_time_domain_comparison(dbs_uv, dbs_uv, final_uv, sfreq,
-                                 ch_names_use, f_dbs,
-                                 t_offset=10.0, dur=5.0,
-                                 out_path=out_d / "02_time_domain.png")
 
     # Build subset Raw so Info channel count matches the data arrays (common ch)
     try:
@@ -937,15 +940,30 @@ def run_pipeline(edf_path: pathlib.Path, f_dbs: float = 7.0,
         raw_topo   = final_raw.copy().pick(picks_topo)
     except Exception:
         raw_topo = final_raw
-    plot_scalp_topomaps(dbs_uv, final_uv, raw_topo, ch_names_use,
-                         out_d / "03_scalp_topomaps.png")
 
-    plot_biomarker_bars(table, out_d / "04_biomarker_bars.png")
+    for theme_name, th in THEMES.items():
+        theme_dir = out_d / theme_name
+        theme_dir.mkdir(exist_ok=True)
+        log.info(f"  Plotting theme: {theme_name}")
 
-    log.info("Generating real-time dashboard GIF …")
-    save_realtime_dashboard(dbs_uv, final_uv, sfreq, ch_names_use, f_dbs,
-                             out_d / "05_realtime_dashboard.gif",
-                             window_sec=5.0, step_sec=0.5, fps=6)
+        plot_triple_psd(dbs_uv, baseline_uv, dbs_uv, final_uv, sfreq, f_dbs,
+                        theme_dir / "01_triple_psd.png", theme=th)
+
+        plot_time_domain_comparison(dbs_uv, dbs_uv, final_uv, sfreq,
+                                     ch_names_use, f_dbs,
+                                     t_offset=10.0, dur=5.0,
+                                     out_path=theme_dir / "02_time_domain.png",
+                                     theme=th)
+
+        plot_scalp_topomaps(dbs_uv, final_uv, raw_topo, ch_names_use,
+                             theme_dir / "03_scalp_topomaps.png", theme=th)
+
+        plot_biomarker_bars(table, theme_dir / "04_biomarker_bars.png", theme=th)
+
+        log.info(f"  Generating real-time dashboard GIF ({theme_name}) …")
+        save_realtime_dashboard(dbs_uv, final_uv, sfreq, ch_names_use, f_dbs,
+                                 theme_dir / "05_realtime_dashboard.gif",
+                                 window_sec=5.0, step_sec=0.5, fps=6, theme=th)
 
     log.info(f"\nAll outputs → {out_d}")
     return {
