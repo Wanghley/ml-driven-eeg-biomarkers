@@ -222,6 +222,379 @@ def allen_hampel_fft(
 
 
 # ---------------------------------------------------------------------------
+# Upgrade 1: SVD Spatial Pre-Filter
+# ---------------------------------------------------------------------------
+
+def svd_dbs_spatial_prefilter(
+    raw: mne.io.BaseRaw,
+    dbs_freq: float,
+    n_components: int | str = "auto",
+    var_threshold: float = 0.70,
+    report: bool = True,
+) -> mne.io.BaseRaw:
+    """Remove the dominant DBS template via epoch-locked SVD.
+
+    Projects out the DBS spatial-temporal template from the continuous signal
+    **before** the spectral Hampel stage so that the Hampel FFT only has to
+    clean residuals rather than the primary artifact topography.
+
+    Algorithm
+    ---------
+    1. Epoch the data at T = round(fs / f_dbs) samples per DBS period.
+    2. Compute mean epoch (C × T) — the deterministic DBS template.
+    3. SVD of mean epoch: mean_ep = U Σ Vᵀ
+    4. Auto-select minimum k such that cumsum(S²) / sum(S²) ≥ var_threshold.
+    5. Template_k = U[:, :k] @ diag(S[:k]) @ Vt[:k, :]     shape: (C, T)
+    6. Subtract Template_k from every epoch; reassemble continuous signal.
+
+    Conservative design
+    -------------------
+    ``var_threshold=0.70`` typically selects exactly 1 component for 7 Hz DBS,
+    matching the conservatism of the ICA stage (SNR > 10, cap=1).  The
+    experimental pipeline's fixed ``n_components=3`` was shown to destroy
+    50–70 % of delta/alpha by including brain-DBS mixed components.
+
+    Args:
+        raw: MNE Raw object (copied internally).
+        dbs_freq: DBS fundamental frequency in Hz.
+        n_components: ``'auto'`` (recommended) or explicit integer count.
+        var_threshold: Fraction of mean-epoch variance that the selected
+            components must explain when ``n_components='auto'``.
+        report: Print per-component diagnostics.
+
+    Returns:
+        Cleaned MNE Raw object.
+    """
+    raw_clean = raw.copy().load_data()
+    data = raw_clean.get_data()              # (n_ch, n_samp)  [V]
+    n_ch, n_samp = data.shape
+    sfreq = float(raw_clean.info["sfreq"])
+
+    T = max(4, int(round(sfreq / dbs_freq)))   # samples per DBS period
+    n_epochs = n_samp // T
+    if n_epochs < 20:
+        if report:
+            print("[SVD Pre-filter] Fewer than 20 complete DBS periods — skipping.")
+        return raw_clean
+
+    usable = n_epochs * T
+    # Build epoch tensor  (n_epochs, n_ch, T)
+    ep = data[:, :usable].reshape(n_ch, n_epochs, T).transpose(1, 0, 2)
+    mean_ep = ep.mean(axis=0)                # (n_ch, T)  — deterministic DBS template
+
+    # SVD of mean epoch — finds the spatial-temporal DBS template components
+    U, S, Vt = np.linalg.svd(mean_ep, full_matrices=False)
+
+    # Component selection by cumulative variance
+    var_frac = (S ** 2) / ((S ** 2).sum() + 1e-30)
+    cum_var  = np.cumsum(var_frac)
+
+    if isinstance(n_components, str) and n_components == "auto":
+        k = int(np.searchsorted(cum_var, var_threshold)) + 1
+        k = max(1, min(k, len(S)))
+    else:
+        k = max(1, min(int(n_components), len(S)))
+
+    if report:
+        print(
+            f"[SVD Pre-filter] f₀={dbs_freq} Hz | T={T} samp | "
+            f"n_epochs={n_epochs} | k={k} component(s) | "
+            f"cumvar={cum_var[k - 1] * 100:.1f}% "
+            f"(threshold={var_threshold * 100:.0f}%)"
+        )
+        for i in range(k):
+            print(f"  Component {i}: S={S[i]:.4e}, var={var_frac[i] * 100:.1f}%")
+
+    # DBS template: k-component low-rank approximation of the mean epoch
+    template = (U[:, :k] * S[:k]) @ Vt[:k, :]   # (n_ch, T)
+
+    # Subtract from every epoch, then reassemble continuous signal
+    ep_clean   = ep - template[np.newaxis, :, :]        # broadcast (n_epochs, n_ch, T)
+    data_clean = data.copy()
+    data_clean[:, :usable] = ep_clean.transpose(1, 0, 2).reshape(n_ch, usable)
+
+    raw_clean._data[:] = data_clean
+    return raw_clean
+
+
+# ---------------------------------------------------------------------------
+# Upgrade 2: PSD-Weighted Harmonic Reference + NLMS Adaptive Filter
+# ---------------------------------------------------------------------------
+
+def make_harmonic_weighted_reference(
+    data_uv: np.ndarray,
+    sfreq: float,
+    f_dbs: float,
+    n_harmonics: int = 12,
+) -> np.ndarray:
+    """Build a multi-harmonic DBS reference with PSD-estimated amplitudes.
+
+    Replaces the generic ``1/k`` taper in the original ``make_dbs_reference``
+    with weights derived from the recording's own power spectral density.
+
+    Rationale
+    ---------
+    DBS stimulators with square or asymmetric pulse shapes produce harmonic
+    spectra that do **not** follow the ``1/k`` decay assumed by a synthetic
+    reference.  When the reference amplitude at 14 Hz (2nd harmonic) is
+    set to 50 % of the fundamental by the ``1/k`` rule but the actual DBS
+    power there is, say, 80 %, the NLMS filter converges insufficiently
+    → harmonic residual survives → inflates beta beyond 200 %.
+
+    Algorithm
+    ---------
+    For each harmonic ``k · f_dbs``:
+
+    1. Welch PSD of the mean-channel signal (averaging reduces per-channel noise).
+    2. Leave-harmonic-out floor: median of ±15 Welch bins, excluding ±3 around
+       the harmonic peak (same estimator as the Hampel FFT background window).
+    3. Amplitude weight = ``sqrt(max(0, PSD[h_bin] − floor))``.
+    4. Weight is floored at 1 % of the strongest harmonic to prevent any
+       harmonic from being zeroed out when brain signal partially masks the floor.
+
+    Args:
+        data_uv: Raw data array in µV, shape (n_channels, n_samples).
+        sfreq: Sampling frequency in Hz.
+        f_dbs: DBS fundamental frequency in Hz.
+        n_harmonics: Maximum number of harmonics to include.
+
+    Returns:
+        Normalised 1-D reference signal of length ``n_samples``.
+    """
+    n_ch, n_samp = data_uv.shape
+    t   = np.arange(n_samp) / sfreq
+    nyq = sfreq / 2.0
+
+    # Welch PSD of the mean channel (reduces single-channel noise)
+    mean_ch  = data_uv.mean(axis=0)
+    nperseg  = min(4096, n_samp // 4)
+    f_w, psd = signal.welch(
+        mean_ch, fs=sfreq, nperseg=nperseg,
+        window="hann", noverlap=nperseg // 2,
+    )
+    df_w = f_w[1] - f_w[0]
+
+    weights: list[tuple[float, float]] = []   # (freq_hz, amplitude)
+
+    for k in range(1, n_harmonics + 1):
+        h = k * f_dbs
+        if h >= nyq:
+            break
+        h_bin = int(round(h / df_w))
+        if h_bin >= len(psd):
+            break
+
+        # Leave-harmonic-out floor (±15 bins, exclude ±3 around the peak)
+        lo    = max(0, h_bin - 15)
+        hi    = min(len(psd), h_bin + 16)
+        flank = np.concatenate([
+            np.arange(lo,                        max(lo, h_bin - 3)),
+            np.arange(min(len(psd), h_bin + 4),  hi),
+        ])
+        floor  = float(np.median(psd[flank])) if flank.size >= 4 else float(psd[h_bin]) * 0.1
+        excess = max(0.0, float(psd[h_bin]) - floor)
+        weights.append((h, float(np.sqrt(excess))))
+
+    if not weights or max(a for _, a in weights) < 1e-12:
+        # Fallback to classic 1/k taper if PSD estimation fails
+        ref = np.zeros(n_samp)
+        for k in range(1, n_harmonics + 1):
+            if k * f_dbs >= nyq:
+                break
+            ref += (1.0 / k) * np.sin(2.0 * np.pi * k * f_dbs * t)
+        peak = float(np.abs(ref).max())
+        return ref / (peak + 1e-10)
+
+    max_amp = max(a for _, a in weights) + 1e-10
+    ref = np.zeros(n_samp)
+    for h, amp in weights:
+        w_norm = max(amp / max_amp, 0.01)    # floor at 1 % of dominant harmonic
+        ref += w_norm * np.sin(2.0 * np.pi * h * t)
+
+    peak = float(np.abs(ref).max())
+    return ref / (peak + 1e-10)
+
+
+def nlms_filter_channel(
+    x: np.ndarray,
+    ref: np.ndarray,
+    N: int = 64,
+    mu: float = 0.005,
+    eps: float = 1e-8,
+    n_conv_samp: int = 2048,
+) -> np.ndarray:
+    """Normalised Least Mean Square (NLMS) adaptive filter — single channel.
+
+    Models the DBS artifact as a linear FIR transformation of the reference
+    signal and subtracts that estimate from the input channel.
+
+    Reference model
+    ---------------
+    The adaptive filter ``h(n) ∈ ℝ^N`` models the DBS component linearly
+    predictable from the reference ``r(n)``::
+
+        ŷ(n) = h(n)ᵀ · r_vec(n)          r_vec = [r(n), …, r(n−N+1)]
+        e(n)  = x(n) − ŷ(n)              cleaned estimate
+
+    NLMS weight update::
+
+        h(n+1) = h(n) + μ / (‖r_vec‖² + ε) · e(n) · r_vec(n)
+
+    Normalisation by ``‖r_vec‖²`` ensures convergence for any bounded input
+    power — the effective step size is self-tuning.
+
+    Implementation
+    --------------
+    Phase 1 (adaptation): run ``n_conv_samp`` steps to learn ``h``.
+    Phase 2 (application): apply converged FIR ``h`` to the full reference
+                            and subtract from input via ``scipy.signal.lfilter``.
+
+    Args:
+        x: Input channel signal (n_samples,).
+        ref: Reference signal of same length.
+        N: FIR filter order (number of taps).
+        mu: NLMS step size (lower = more stable, slower convergence).
+        eps: Regularisation to prevent division by zero.
+        n_conv_samp: Number of samples used for weight convergence.
+
+    Returns:
+        Cleaned channel signal (n_samples,).
+    """
+    n = len(x)
+    n_conv = min(n_conv_samp, n // 4)
+
+    h       = np.zeros(N)
+    ref_buf = np.zeros(N)
+
+    # Phase 1: weight convergence via NLMS iteration
+    for i in range(n_conv):
+        ref_buf    = np.roll(ref_buf, 1)
+        ref_buf[0] = ref[i]
+        y_i   = float(np.dot(h, ref_buf))
+        e_i   = float(x[i]) - y_i
+        norm  = float(np.dot(ref_buf, ref_buf)) + eps
+        h    += (mu / norm) * e_i * ref_buf
+
+    # Phase 2: apply converged FIR (vectorised via lfilter)
+    artifact = signal.lfilter(h, [1.0], ref)
+    return x - artifact
+
+
+# ---------------------------------------------------------------------------
+# Upgrade 3: Targeted Post-ICA Spectral Interpolation
+# ---------------------------------------------------------------------------
+
+def targeted_harmonic_interpolation(
+    raw: mne.io.BaseRaw,
+    dbs_freq: float,
+    bandwidth_hz: float = 0.20,
+    flank_hz: float = 1.0,
+    n_harmonics_max: int = 20,
+    report: bool = True,
+) -> mne.io.BaseRaw:
+    """Post-processing: forced linear interpolation of residual harmonic bins.
+
+    After Allen Hampel FFT + optional NLMS + ICA, sub-threshold harmonic
+    residuals may persist.  This stage performs a final deterministic cleanup
+    by linearly interpolating the complex spectrum at all known DBS harmonic
+    positions (``k · f_dbs``), regardless of residual amplitude.
+
+    Why forced interpolation (not another Hampel pass)
+    ---------------------------------------------------
+    The primary Hampel stage requires a spike to exceed the MAD threshold to
+    be replaced.  Residuals that survive primary removal are by definition
+    below the MAD threshold, so a second Hampel pass would leave them
+    untouched.  Forced interpolation at *known* harmonic positions captures
+    these sub-threshold residuals without raising the detection sensitivity
+    (which would risk false positives in brain bands).
+
+    Why linear interpolation (not median replacement)
+    -------------------------------------------------
+    Linear interpolation draws only from the immediately flanking bins, which
+    survived all prior cleanup stages and are clean.  Median replacement
+    (used in ``allen_hampel_fft``) draws from a wider window that, at
+    high-beta harmonics (28 Hz), may span genuine brain oscillations and
+    underestimate the local background.  Linear interpolation is also
+    monotone-bounded: it cannot amplify energy above the clean flanking values.
+
+    Parameters
+    ----------
+    bandwidth_hz:
+        Half-width of the interpolated zone around each harmonic.
+        Default 0.20 Hz — slightly wider than the primary Hampel stage
+        (0.15 Hz) to catch broadened post-ICA residuals.
+    flank_hz:
+        Width of the reference flanks on each side of the zone.
+        Auto-capped at ``f_dbs / 2`` to prevent adjacent harmonics from
+        contaminating the reference bins.
+    """
+    raw_clean = raw.copy().load_data()
+    data    = raw_clean.get_data()            # (n_ch, n_samp)  [V]
+    n_ch, n_samp = data.shape
+    sfreq   = float(raw_clean.info["sfreq"])
+    nyquist = sfreq / 2.0
+
+    Xf    = np.fft.rfft(data, axis=1)         # (n_ch, n_freq) complex
+    freqs = np.fft.rfftfreq(n_samp, 1.0 / sfreq)
+    df    = float(freqs[1] - freqs[0])
+    n_freq = Xf.shape[1]
+
+    half_bw   = max(1, int(round(bandwidth_hz / df)))
+    # Cap flank to half the inter-harmonic gap so adjacent harmonics never
+    # contaminate the reference bins
+    max_flank = max(4, int(round(min(flank_hz, dbs_freq * 0.45) / df)))
+
+    n_interpolated = 0
+    harmonics_done: list[float] = []
+
+    for k in range(1, n_harmonics_max + 1):
+        h = k * dbs_freq
+        if h >= nyquist:
+            break
+        h_bin = int(round(h / df))
+        if h_bin >= n_freq - max_flank - 1:
+            break
+
+        zone_s  = max(1,          h_bin - half_bw)
+        zone_e  = min(n_freq - 2, h_bin + half_bw + 1)
+        left_s  = max(1,          zone_s - max_flank)
+        right_e = min(n_freq - 1, zone_e + max_flank)
+
+        ref_bins    = np.concatenate([
+            np.arange(left_s, zone_s),
+            np.arange(zone_e, right_e),
+        ])
+        target_bins = np.arange(zone_s, zone_e)
+
+        if len(ref_bins) < 4 or len(target_bins) == 0:
+            continue
+
+        rb = ref_bins.astype(float)
+        tb = target_bins.astype(float)
+
+        # Vectorised linear interpolation: real and imaginary parts separately
+        # np.interp is monotone-bounded — no Runge overshoot possible
+        for ch in range(n_ch):
+            Xf[ch, target_bins] = (
+                np.interp(tb, rb, Xf[ch, ref_bins].real)
+                + 1j * np.interp(tb, rb, Xf[ch, ref_bins].imag)
+            )
+
+        n_interpolated += len(target_bins)
+        harmonics_done.append(h)
+
+    if report:
+        print(
+            f"[Spectral Interp] f₀={dbs_freq} Hz | ±{bandwidth_hz} Hz zone | "
+            f"{len(harmonics_done)} harmonics | "
+            f"{n_interpolated} bins/channel modified"
+        )
+
+    raw_clean._data[:] = np.fft.irfft(Xf, n=n_samp, axis=1)
+    return raw_clean
+
+
+# ---------------------------------------------------------------------------
 # Innovation 2: EMD Phase-Locked Template Subtraction
 # ---------------------------------------------------------------------------
 
