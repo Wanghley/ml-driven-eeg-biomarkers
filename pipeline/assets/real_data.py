@@ -653,6 +653,7 @@ def real_ica_pipeline(
 
 @asset(
     group_name="real_data",
+    deps=["real_ica_pipeline"],   # ordering-only dep — real_ica_pipeline returns MaterializeResult (no stored value)
     description=(
         "Export the final pipeline-cleaned AWAKE7 and SLEEP7 signals as EDF files. "
         "Also exports DBS-only-removed (pre-ICA) variants for comparison. "
@@ -663,7 +664,6 @@ def real_edf_export(
     context: AssetExecutionContext,
     real_raw_loaded: dict,
     real_dbs_filtered: dict,
-    real_ica_pipeline: None,
     eeg_config: EEGPipelineConfig,
 ) -> Output:
     """

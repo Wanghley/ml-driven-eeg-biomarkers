@@ -466,6 +466,7 @@ def synthetic_ica_pipeline(
 
 @asset(
     group_name="synthetic",
+    deps=["synthetic_ica_pipeline"],   # ordering-only dep — synthetic_ica_pipeline returns MaterializeResult
     description=(
         "Export synthetic pipeline signals (contaminated, best DBS-removed, final clean, "
         "and brain reference) as EDF files for external analysis or viewer."
@@ -475,7 +476,6 @@ def synthetic_edf_export(
     context: AssetExecutionContext,
     synthetic_signal: dict,
     synthetic_dbs_filtered: dict,
-    synthetic_ica_pipeline: None,
     eeg_config: EEGPipelineConfig,
 ) -> Output:
     """
