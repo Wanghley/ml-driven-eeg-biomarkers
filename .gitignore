@@ -240,3 +240,7 @@ scratch/
 test_output/
 temp_analysis/
 notebooks/data/
+
+# ── Dagter specific: ignore all other files in the project except for source code and configs ──
+.dagster/*
+.tmp_dagster*/
