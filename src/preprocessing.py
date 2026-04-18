@@ -386,47 +386,112 @@ class EEGPreprocessor:
                                               n_sigmas=n_sigmas,
                                               attenuation_db=attenuation_db)
 
-    def apply_surgical_pipeline(self, raw: mne.io.Raw, f_dbs: float,
-                                 target_sfreq: float = 256.0,
-                                 run_ica: bool = True) -> mne.io.Raw:
+    def apply_surgical_pipeline(
+        self,
+        raw: mne.io.Raw,
+        f_dbs: float,
+        target_sfreq: float = 256.0,
+        run_ica: bool = True,
+        run_svd: bool = True,
+        run_nlms: bool = False,
+        run_spectral_interp: bool = True,
+    ) -> mne.io.Raw:
         """
         Surgical DBS removal pipeline.
 
         The caller (pipeline.py) has already applied the broadband bandpass and
-        line-noise notch, so this method skips those steps to avoid double-filtering
-        which would destroy brain-band power.
+        line-noise notch, so this method skips those steps to avoid double-filtering.
 
-        Stage II: Allen Complex-Domain Hampel FFT
-            Operates on the full-length rFFT (δf = fs/N ≈ 17 mHz for 120 s).
+        Stage I   — SVD Spatial Pre-Filter (run_svd=True by default)
+            Epoch-locked SVD removes the dominant DBS template (top-k components
+            selected automatically by variance threshold=0.70) from the continuous
+            signal before spectral cleaning.  This eliminates the primary artifact
+            topography so the Hampel FFT only has to clean residuals.
+
+        Stage II  — Allen Complex-Domain Hampel FFT (always applied)
+            Full-length rFFT (δf = fs/N ≈ 8 mHz for 120 s @ 256 Hz).
             For each DBS harmonic only the ±0.15 Hz spike zone is touched;
-            every other bin — including all off-harmonic theta/alpha — is left
-            exactly as-is.
+            every off-harmonic bin is left exactly as-is.
 
-        Stage III: Conservative ICA
-            Rejects only components whose DBS-harmonic SNR > 5 (not 3),
-            capped at 2 to prevent over-exclusion of brain components.
+        Stage IIb — Harmonic-Aware NLMS (run_nlms=False by default)
+            NLMS adaptive filter using PSD-measured harmonic amplitudes as the
+            reference signal instead of the generic 1/k taper.  Off by default —
+            validate on a held-out recording before enabling, as incorrect
+            amplitude estimates can cancel brain beta.
+
+        Stage III — Conservative ICA (run_ica=True by default)
+            Rejects only the single component whose DBS-harmonic SNR > 10,
+            capped at 1 to prevent over-exclusion of brain components.
+
+        Stage IV  — Targeted Spectral Interpolation (run_spectral_interp=True by default)
+            Post-ICA forced linear interpolation of the complex spectrum at all
+            known harmonic positions (±0.20 Hz zone).  Removes sub-threshold
+            residuals that survive the MAD-based Hampel stage.
         """
+        from src.artifact_removal import (
+            allen_hampel_fft,
+            svd_dbs_spatial_prefilter,
+            make_harmonic_weighted_reference,
+            nlms_filter_channel,
+            targeted_harmonic_interpolation,
+        )
+        from mne.preprocessing import ICA
+
         print(f"--- Starting Surgical Pipeline (f0={f_dbs} Hz) ---")
+        raw_surg = raw
 
-        from src.artifact_removal import allen_hampel_fft
+        # ── Stage I: SVD Spatial Pre-Filter ──────────────────────────────────
+        if run_svd:
+            print("Stage I: SVD Spatial Pre-filter...")
+            raw_surg = svd_dbs_spatial_prefilter(
+                raw_surg,
+                dbs_freq=f_dbs,
+                n_components="auto",
+                var_threshold=0.70,
+            )
 
-        # Stage II: Allen Complex-Domain Hampel FFT (surgical, single pass)
-        print(f"Allen Complex-Domain Hampel FFT: f0={f_dbs} Hz")
+        # ── Stage II: Allen Complex-Domain Hampel FFT ─────────────────────────
+        print(f"Stage II: Allen Complex-Domain Hampel FFT (f0={f_dbs} Hz)")
         raw_surg = allen_hampel_fft(
-            raw,
+            raw_surg,
             dbs_freq=f_dbs,
             window_hz=2.0,
             n_sigmas=3.5,
             target_half_hz=0.15,
         )
 
-        # Stage III: Conservative ICA
+        # ── Stage IIb: Harmonic-Aware NLMS (optional) ────────────────────────
+        if run_nlms:
+            print("Stage IIb: Harmonic-Aware NLMS...")
+            data_uv    = raw_surg.get_data() * 1e6           # V → µV
+            sfreq_nlms = float(raw_surg.info["sfreq"])
+            ref        = make_harmonic_weighted_reference(
+                data_uv, sfreq_nlms, f_dbs, n_harmonics=12,
+            )
+            data_clean = np.zeros_like(data_uv)
+            for ch in range(data_uv.shape[0]):
+                data_clean[ch] = nlms_filter_channel(
+                    data_uv[ch], ref, N=64, mu=0.005,
+                )
+            raw_surg = raw_surg.copy()
+            raw_surg._data[:] = data_clean / 1e6             # µV → V
+
+        # ── Stage III: Conservative ICA ───────────────────────────────────────
         if run_ica:
-            print("Applying Conservative ICA Rejection...")
-            from mne.preprocessing import ICA
-            ica = ICA(n_components=15, method='fastica', random_state=42, verbose=False)
+            print("Stage III: Conservative ICA Rejection...")
+            ica = ICA(n_components=15, method="fastica", random_state=42, verbose=False)
             ica.fit(raw_surg, verbose=False)
             raw_surg = self._apply_automated_ica(raw_surg, ica, f_dbs)
+
+        # ── Stage IV: Targeted Spectral Interpolation ─────────────────────────
+        if run_spectral_interp:
+            print("Stage IV: Targeted Spectral Interpolation...")
+            raw_surg = targeted_harmonic_interpolation(
+                raw_surg,
+                dbs_freq=f_dbs,
+                bandwidth_hz=0.20,
+                flank_hz=1.0,
+            )
 
         return raw_surg
 
