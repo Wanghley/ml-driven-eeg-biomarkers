@@ -19,9 +19,15 @@ Or via workspace.yaml (recommended for deployment)::
 from dagster import Definitions, FilesystemIOManager
 
 from pipeline.assets import all_assets
-from pipeline.jobs import synthetic_job, real_data_job, full_eeg_pipeline, export_edf_job
+from pipeline.jobs import (
+    synthetic_job,
+    real_data_job,
+    full_eeg_pipeline,
+    export_edf_job,
+    eeg_ingest_job,
+)
 from pipeline.resources import EEGPipelineConfig
-from pipeline.sensors import new_edf_sensor
+from pipeline.sensors import new_edf_sensor, edf_ingest_sensor
 
 defs = Definitions(
     assets=all_assets,
@@ -30,6 +36,7 @@ defs = Definitions(
         real_data_job,
         full_eeg_pipeline,
         export_edf_job,
+        eeg_ingest_job,          # generic single-file pipeline
     ],
     resources={
         # Resource key must match the parameter name used in @asset functions
@@ -50,5 +57,8 @@ defs = Definitions(
         # .dagster/storage/  (swap for S3IOManager, GCSIOManager, etc. in prod)
         "io_manager": FilesystemIOManager(base_dir=".dagster/storage"),
     },
-    sensors=[new_edf_sensor],
+    sensors=[
+        new_edf_sensor,          # legacy XU-specific sensor (real_data_job)
+        edf_ingest_sensor,       # generic sensor watching data/raw/ (eeg_ingest_job)
+    ],
 )
