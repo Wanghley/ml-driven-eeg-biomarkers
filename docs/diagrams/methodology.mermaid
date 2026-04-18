@@ -1,0 +1,96 @@
+---
+config:
+  layout: dagre
+---
+flowchart TB
+ subgraph Orchestration["Dagster Pipeline Orchestration"]
+        Trigger{"Trigger Pipeline"}
+        Sensor(["edf_ingest_sensor"])
+        Ingestion["Ingestion"]
+  end
+ subgraph Ingestion["3.2 Data Ingestion - src/ingestion.py"]
+    direction TB
+        MNE["MNE-Python Loader"]
+        RawData[("Raw EDF Files: <br>AWAKE7, SLEEP7, <br>PRE-AWAKE, PRE-SLEEP")]
+        Regex["Regex Channel Normalization"]
+        Resample["Resampling to 256 Hz <br>w/ Anti-aliasing"]
+        IngestFilter["FIR Bandpass 1-119 Hz"]
+        AvgRef["Average Referencing"]
+  end
+ subgraph Preprocessing["3.3 Preprocessing - EEGPreprocessor"]
+    direction TB
+        Standardize["Channel Standardization <br>&amp; 10-20 Montage Assignment"]
+        ClinicalFilter["Clinical FIR Bandpass <br>1-110 Hz"]
+  end
+ subgraph SurgicalCascade["Surgical Cascade Pipeline"]
+        Allen["2. Allen Complex-Domain Hampel FFT <br>±0.15 Hz Replacement"]
+        SVD["1. SVD Spatial Pre-Filter <br>70% Var / 1 Component"]
+        ICA["3. Conservative ICA Rejection <br>SNR &gt; 10.0 / Max 1 Comp"]
+        Interp["4. Targeted Spectral Interpolation <br>±0.20 Hz Flanks"]
+  end
+ subgraph AltMethods["Alternative Suppression Methods"]
+        M1["Spectrum Fit"]
+        M2["Comb Notch Q50/200"]
+        M3["Hampel Time-Domain"]
+        M4["Sinusoidal Regression"]
+  end
+ subgraph Wiener["Conditional Path"]
+        W1["Baseline-Referenced <br>Wiener Spectral Gating"]
+  end
+ subgraph ArtifactRemoval["3.4 DBS Artifact Suppression"]
+    direction TB
+        MethodType{"Method Selection"}
+        SurgicalCascade
+        AltMethods
+        Wiener
+  end
+ subgraph Spectral["Spectral Analysis - Welch"]
+        S1["Canonical Bands: <br>Delta, Theta, Alpha, Beta, Gamma"]
+        S2["Off-Harmonic Band Power <br>Excl. ±0.5 Hz Harmonics"]
+  end
+ subgraph Spikes["Spike Morphology - src/spike_features.py"]
+        Sp1["Adaptive Threshold Detection <br>Median ± 5 MAD"]
+        Sp2["30+ Dimensional Vector: <br>Amp, Temporal, Sharpness, Area, <br>Spectral, Inter-spike Dynamics"]
+  end
+ subgraph Features["3.5 Feature Extraction"]
+    direction TB
+        SplitFeatures{"Feature Type"}
+        Spectral
+        Spikes
+  end
+ subgraph Outputs["3.6 & 3.7 Evaluation & Outputs"]
+    direction LR
+        Evaluation["Performance Evaluation: <br>Preservation % &amp; Attenuation dB"]
+        FinalEDF[("Cleaned EDF Files")]
+        Figs["Method Comparison Figs"]
+        Maps["Topo Band Power Maps"]
+        Tables["Spike Feature Tables"]
+        Matrix["ML-Ready Feature Matrix"]
+  end
+    Sensor -- Monitors /data/raw/ --> Trigger
+    Trigger -- Infers f_DBS --> Ingestion
+    RawData --> MNE
+    MNE --> Regex
+    Regex --> Resample
+    Resample --> IngestFilter
+    IngestFilter --> AvgRef
+    AvgRef --> Standardize
+    Standardize --> ClinicalFilter
+    ClinicalFilter --> MethodType
+    SVD --> Allen
+    Allen --> ICA
+    ICA --> Interp
+    MethodType --> SurgicalCascade & AltMethods
+    MethodType -. If Baseline Exists .-> Wiener
+    Interp --> SplitFeatures
+    SplitFeatures --> Spectral & Spikes
+    Spectral --> Evaluation
+    Spikes --> Evaluation
+    Evaluation --> FinalEDF & Figs & Maps & Tables & Matrix
+
+    style RawData fill:#cfd8dc
+    style SurgicalCascade fill:#e1f5fe,stroke:#01579b
+    style FinalEDF fill:#cfd8dc
+    style Orchestration fill:#f5f5f5,stroke:#333,stroke-width:2px
+    style Features fill:#fff3e0,stroke:#e65100
+    style Outputs fill:#e8f5e9,stroke:#1b5e20

@@ -1,0 +1,37 @@
+graph LR
+    %% --- Nodes ---
+    subgraph InputSignals [Inputs]
+        InputX["Reference Input<br/>x(t)"]
+        InputD["Desired Input<br/>Contaminated EEG<br/>d(t)"]
+    end
+
+    subgraph "Adaptive Filter (NLMS)"
+        direction TB
+        Weights["Digital Filter<br/>Output y(t) = wᵀ(t)x(t)"]
+        UpdateAlg["NLMS Update Algorithm<br/>w(t+1) = w(t) + μe(t)x(t) / (||x(t)||² + ε)"]
+    end
+
+    Sum(("Σ"))
+    FinalOutput["Clean Output<br/>e(t)"]
+
+    %% --- Signal Flow Connections ---
+    InputX -->|"Reference vector"| Weights
+    InputX -->|"Reference vector"| UpdateAlg
+
+    InputD -->|"+ Desired signal"| Sum
+    Weights -->|"- Estimate signal<br/>y(t)"| Sum
+
+    Sum -->|"Error signal<br/>e(t) = d(t) - y(t)"| FinalOutput
+
+    %% --- Feedback loop for adaptation ---
+    FinalOutput -.->|"Feedback error"| UpdateAlg
+    UpdateAlg -->|"Updated weights<br/>w(t+1)"| Weights
+
+    %% --- Styling ---
+    classDef io fill:#f9f,stroke:#333,stroke-width:2px,rx:5,ry:5;
+    classDef alg fill:#e1f5fe,stroke:#0277bd,stroke-width:1px,rx:5,ry:5;
+    classDef junction fill:#fff9c4,stroke:#fbc02d,stroke-width:2px;
+
+    class InputX,InputD,FinalOutput io;
+    class Weights,UpdateAlg alg;
+    class Sum junction;
