@@ -37,9 +37,22 @@ full_eeg_pipeline = define_asset_job(
 
 export_edf_job = define_asset_job(
     name="export_edf_job",
-    selection=AssetSelection.assets(["real_edf_export", "synthetic_edf_export"]),
+    selection=(
+        AssetSelection.assets("real_edf_export")
+        | AssetSelection.assets("synthetic_edf_export")
+    ),
     description=(
         "Export final pipeline-cleaned signals as EDF files. "
         "Requires upstream .fif files produced by the full pipeline runs."
+    ),
+)
+
+eeg_ingest_job = define_asset_job(
+    name="eeg_ingest_job",
+    selection=AssetSelection.groups("eeg_pipeline"),
+    description=(
+        "Generic single-file EEG pipeline: ingest EDF → surgical DBS removal → "
+        "spike feature extraction → ML feature matrix. "
+        "Triggered automatically by edf_ingest_sensor when a new EDF is detected."
     ),
 )
